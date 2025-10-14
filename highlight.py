@@ -5,22 +5,34 @@
 Kindle Ebook Highlighter - COMPLETE VERSION with Batch Processing
 
 All features included:
-- Batch processing (--batch flag to process ALL books)
+- Batch processing enabled by DEFAULT (process ALL books with 95%+ match confidence)
+- Library mode enabled by DEFAULT
+- Text formatting preservation (bold, italic, underline, links, footnotes)
 - All 3 matching methods: regex, difflib, vector
 - Compare mode
-- Fixed html_path → html_file bug
-- Improved book matching
-- All original functionality preserved
+- Paragraph formatting preservation
+- HTML preservation for debugging (--preserve-html)
+- Enhanced verbose logging with -vv
+- Improved robustness and error handling
 
 Usage:
-  Batch process ALL books:
-    python kindle_highlighter.py --library --clippings "My Clippings.txt" --batch -v
+  Default: Batch process ALL books from library with 95%+ match confidence:
+    python kindle_highlighter.py --clippings "My Clippings.txt" -v
   
-  Process single best match:
-    python kindle_highlighter.py --library --clippings "My Clippings.txt" -v
+  Process single best match only:
+    python kindle_highlighter.py --clippings "My Clippings.txt" --no-batch -v
   
-  Compare all methods:
+  Process specific ebook file:
+    python kindle_highlighter.py --ebook book.mobi --clippings "My Clippings.txt" -v
+  
+  Batch with HTML preservation for debugging:
+    python kindle_highlighter.py --clippings "My Clippings.txt" --preserve-html -vv
+  
+  Compare all methods on specific file:
     python kindle_highlighter.py --ebook book.mobi --clippings "My Clippings.txt" --compare -v
+  
+  List all books in library:
+    python kindle_highlighter.py --list-books
 """
 
 import sys
@@ -32,12 +44,12 @@ import logging
 import zipfile
 import shutil
 import glob
-from typing import List, Dict, Tuple, Callable, Optional
+from typing import List, Dict, Tuple, Callable, Optional, Set
 from pathlib import Path
 from difflib import SequenceMatcher
 from docx import Document
 from docx.enum.text import WD_COLOR_INDEX
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString, Tag
 from thefuzz import process as fuzzy_process
 from thefuzz import fuzz
 
@@ -60,14 +72,19 @@ def setup_logging(verbosity: int):
         level = logging.WARNING
     elif verbosity == 1:
         level = logging.INFO
-    else:
+    else:  # 2 or more
         level = logging.DEBUG
     
     handler = logging.StreamHandler(sys.stdout)
-    formatter = logging.Formatter('%(levelname)s: %(message)s')
+    if level == logging.DEBUG:
+        formatter = logging.Formatter('%(levelname)s [%(funcName)s]: %(message)s')
+    else:
+        formatter = logging.Formatter('%(levelname)s: %(message)s')
     handler.setFormatter(formatter)
     logger.addHandler(handler)
     logger.setLevel(level)
+    
+    logger.debug(f"Logging configured at level: {logging.getLevelName(level)}")
 
 # --- HELPER FUNCTIONS ---
 
@@ -85,6 +102,8 @@ def normalize_title_for_matching(title: str) -> str:
     - Remove extra whitespace
     - Remove special chars
     """
+    logger.debug(f"Normalizing title: '{title}'")
+    
     # Remove author/series in parentheses at the end
     title_clean = re.sub(r'\s*\([^)]+\)\s*$', '', title)
     
@@ -94,6 +113,7 @@ def normalize_title_for_matching(title: str) -> str:
     # Remove multiple spaces
     title_clean = re.sub(r'\s+', ' ', title_clean).strip()
     
+    logger.debug(f"Normalized to: '{title_clean}'")
     return title_clean
 
 def find_calibre_binary() -> Optional[str]:
@@ -110,7 +130,7 @@ def find_calibre_binary() -> Optional[str]:
             binary_path = os.path.join(app_path, 'Contents/MacOS/ebook-convert')
             logger.debug(f"Checking: {binary_path}")
             if os.path.exists(binary_path) and os.access(binary_path, os.X_OK):
-                logger.debug(f"Found Calibre binary: {binary_path}")
+                logger.debug(f"✓ Found Calibre binary: {binary_path}")
                 return binary_path
         
         common_paths = [
@@ -121,7 +141,7 @@ def find_calibre_binary() -> Optional[str]:
         logger.debug(f"Checking common macOS paths: {common_paths}")
         for path in common_paths:
             if os.path.exists(path) and os.access(path, os.X_OK):
-                logger.debug(f"Found Calibre binary: {path}")
+                logger.debug(f"✓ Found Calibre binary: {path}")
                 return path
     
     # Linux/Unix
@@ -135,7 +155,7 @@ def find_calibre_binary() -> Optional[str]:
         logger.debug(f"Checking paths: {common_paths}")
         for path in common_paths:
             if os.path.exists(path) and os.access(path, os.X_OK):
-                logger.debug(f"Found Calibre binary: {path}")
+                logger.debug(f"✓ Found Calibre binary: {path}")
                 return path
     
     # Windows
@@ -150,7 +170,7 @@ def find_calibre_binary() -> Optional[str]:
         logger.debug(f"Checking paths: {common_paths}")
         for path in common_paths:
             if os.path.exists(path):
-                logger.debug(f"Found Calibre binary: {path}")
+                logger.debug(f"✓ Found Calibre binary: {path}")
                 return path
     
     # Try in PATH
@@ -166,12 +186,14 @@ def find_calibre_binary() -> Optional[str]:
         )
         if result.returncode == 0:
             path = result.stdout.strip().split('\n')[0]
-            logger.debug(f"Found ebook-convert in PATH: {path}")
+            logger.debug(f"✓ Found ebook-convert in PATH: {path}")
             return path
         else:
             logger.debug(f"Command failed with return code: {result.returncode}")
     except (FileNotFoundError, subprocess.TimeoutExpired) as e:
         logger.debug(f"PATH search failed: {e}")
+    except Exception as e:
+        logger.debug(f"Unexpected error in PATH search: {e}")
     
     logger.debug("Calibre binary not found")
     return None
@@ -225,11 +247,13 @@ def check_converter_available(calibre_path: Optional[str] = None) -> Tuple[Optio
             timeout=5
         )
         if result.returncode == 0:
-            logger.debug("Found standalone ebook-converter")
+            logger.debug("✓ Found standalone ebook-converter")
             logger.info("Using standalone ebook-converter")
             return 'ebook-converter', 'htmlz'
     except (FileNotFoundError, subprocess.TimeoutExpired) as e:
         logger.debug(f"Standalone ebook-converter not found: {e}")
+    except Exception as e:
+        logger.debug(f"Unexpected error checking ebook-converter: {e}")
     
     logger.warning("No ebook converter found")
     return None, None
@@ -249,42 +273,44 @@ def check_dependencies(calibre_path: Optional[str] = None) -> Dict[str, bool]:
     try:
         import docx
         deps['docx'] = True
-        logger.debug("python-docx found")
+        logger.debug("✓ python-docx found")
     except ImportError:
-        logger.error("python-docx not found. Install: pip install python-docx")
+        logger.error("✗ python-docx not found. Install: pip install python-docx")
     
     try:
         import bs4
         deps['bs4'] = True
-        logger.debug("beautifulsoup4 found")
+        logger.debug("✓ beautifulsoup4 found")
     except ImportError:
-        logger.error("beautifulsoup4 not found. Install: pip install beautifulsoup4")
+        logger.error("✗ beautifulsoup4 not found. Install: pip install beautifulsoup4")
     
     try:
         import thefuzz
         deps['thefuzz'] = True
-        logger.debug("thefuzz found")
+        logger.debug("✓ thefuzz found")
     except ImportError:
-        logger.error("thefuzz not found. Install: pip install thefuzz python-Levenshtein")
+        logger.error("✗ thefuzz not found. Install: pip install thefuzz python-Levenshtein")
     
     logger.debug("Checking for ebook converter...")
     converter, _ = check_converter_available(calibre_path)
     deps['converter'] = converter is not None
     if not deps['converter']:
-        logger.error("No ebook converter found. Install Calibre or ebook-converter")
+        logger.error("✗ No ebook converter found. Install Calibre or ebook-converter")
+    else:
+        logger.debug("✓ Ebook converter found")
     
     logger.debug("Checking optional conversion libraries...")
     try:
         import mobi
         deps['mobi'] = True
-        logger.debug("mobi library found (optional)")
+        logger.debug("✓ mobi library found (optional)")
     except ImportError:
         logger.debug("mobi library not found (optional: pip install mobi)")
     
     try:
         import ebooklib
         deps['ebooklib'] = True
-        logger.debug("ebooklib found (optional)")
+        logger.debug("✓ ebooklib found (optional)")
     except ImportError:
         logger.debug("ebooklib not found (optional: pip install ebooklib)")
     
@@ -297,7 +323,7 @@ def check_nlp_libraries() -> bool:
         import torch
         import nltk
         from sentence_transformers import SentenceTransformer, util
-        logger.debug("NLP libraries found (torch, nltk, sentence_transformers)")
+        logger.debug("✓ NLP libraries found (torch, nltk, sentence_transformers)")
         return True
     except ImportError as e:
         logger.debug(f"NLP library missing: {e}")
@@ -317,6 +343,9 @@ def find_calibre_library(library_path: Optional[str] = None) -> Path:
     if not path.exists():
         handle_error(f"Calibre library not found at: {path}")
     
+    if not path.is_dir():
+        handle_error(f"Calibre library path is not a directory: {path}")
+    
     logger.info(f"Using Calibre library: {path}")
     return path
 
@@ -327,48 +356,61 @@ def discover_books(library_path: Path, format_filter: str = 'mobi') -> List[Dict
     
     books = []
     format_filter = format_filter.lower()
+    scanned_dirs = 0
+    scanned_files = 0
     
-    for root, dirs, files in os.walk(library_path):
-        for file in files:
-            if file.lower().endswith(f'.{format_filter}'):
-                file_path = Path(root) / file
-                logger.debug(f"Found ebook: {file_path}")
-                
-                metadata_file = Path(root) / 'metadata.opf'
-                title = None
-                author = None
-                
-                if metadata_file.exists():
-                    logger.debug(f"Reading metadata from: {metadata_file}")
-                    try:
-                        with open(metadata_file, 'r', encoding='utf-8') as f:
-                            soup = BeautifulSoup(f, 'xml')
-                            title_tag = soup.find('dc:title')
-                            author_tag = soup.find('dc:creator')
-                            if title_tag:
-                                title = title_tag.get_text(strip=True)
-                                logger.debug(f"  Title from metadata: {title}")
-                            if author_tag:
-                                author = author_tag.get_text(strip=True)
-                                logger.debug(f"  Author from metadata: {author}")
-                    except Exception as e:
-                        logger.debug(f"Failed to parse metadata: {e}")
-                
-                if not title:
-                    folder_name = Path(root).name
-                    title = re.sub(r'\s*\(\d+\)$', '', folder_name)
-                    logger.debug(f"  Using folder name as title: {title}")
-                
-                books.append({
-                    'path': file_path,
-                    'title': title or file,
-                    'author': author or 'Unknown',
-                    'filename': file,
-                    'folder': Path(root).name
-                })
+    try:
+        for root, dirs, files in os.walk(library_path):
+            scanned_dirs += 1
+            if scanned_dirs % 100 == 0:
+                logger.debug(f"Scanned {scanned_dirs} directories, found {len(books)} books so far...")
+            
+            for file in files:
+                scanned_files += 1
+                if file.lower().endswith(f'.{format_filter}'):
+                    file_path = Path(root) / file
+                    logger.debug(f"Found ebook: {file_path}")
+                    
+                    metadata_file = Path(root) / 'metadata.opf'
+                    title = None
+                    author = None
+                    
+                    if metadata_file.exists():
+                        logger.debug(f"Reading metadata from: {metadata_file}")
+                        try:
+                            with open(metadata_file, 'r', encoding='utf-8') as f:
+                                soup = BeautifulSoup(f, 'xml')
+                                title_tag = soup.find('dc:title')
+                                author_tag = soup.find('dc:creator')
+                                if title_tag:
+                                    title = title_tag.get_text(strip=True)
+                                    logger.debug(f"  Title from metadata: {title}")
+                                if author_tag:
+                                    author = author_tag.get_text(strip=True)
+                                    logger.debug(f"  Author from metadata: {author}")
+                        except Exception as e:
+                            logger.debug(f"Failed to parse metadata: {e}")
+                    
+                    if not title:
+                        folder_name = Path(root).name
+                        title = re.sub(r'\s*\(\d+\)$', '', folder_name)
+                        logger.debug(f"  Using folder name as title: {title}")
+                    
+                    books.append({
+                        'path': file_path,
+                        'title': title or file,
+                        'author': author or 'Unknown',
+                        'filename': file,
+                        'folder': Path(root).name
+                    })
+    except Exception as e:
+        logger.error(f"Error during library scan: {e}")
+        logger.debug("Full traceback:", exc_info=True)
     
-    logger.info(f"Found {len(books)} books in library")
-    logger.debug(f"Book list: {[b['title'] for b in books[:5]]}{'...' if len(books) > 5 else ''}")
+    logger.info(f"✓ Found {len(books)} books in library (scanned {scanned_dirs} directories, {scanned_files} files)")
+    if books:
+        logger.debug(f"First 10 books: {[b['title'] for b in books[:10]]}")
+    
     return books
 
 def match_books_to_clippings(books: List[Dict], clippings_titles: List[str], min_score: int = MIN_TITLE_MATCH_SCORE) -> List[Dict]:
@@ -388,10 +430,16 @@ def match_books_to_clippings(books: List[Dict], clippings_titles: List[str], min
     title_counts = Counter(clippings_titles)
     
     logger.info(f"Matching {len(books)} library books against {len(title_counts)} unique titles from clippings...")
+    logger.debug(f"Clipping titles: {list(title_counts.keys())[:10]}{'...' if len(title_counts) > 10 else ''}")
     
     matches = []
+    processed_titles = 0
     
     for clip_title, highlight_count in title_counts.most_common():
+        processed_titles += 1
+        if processed_titles % 10 == 0:
+            logger.debug(f"Processing clipping title {processed_titles}/{len(title_counts)}")
+        
         clip_title_clean = normalize_title_for_matching(clip_title)
         
         best_score = 0
@@ -424,22 +472,27 @@ def match_books_to_clippings(books: List[Dict], clippings_titles: List[str], min
             })
             
             logger.debug(f"'{clip_title_clean}' ({highlight_count} highlights) -> "
-                        f"'{normalize_title_for_matching(best_book['title'])}' ({best_score}%)")
+                        f"'{normalize_title_for_matching(best_book['title'])}' ({best_score}%) [{best_method}]")
     
     # Sort by: 1) score desc, 2) highlight count desc
     matches.sort(key=lambda x: (x['score'], x['highlight_count']), reverse=True)
     
+    logger.debug(f"Match complete: {len(matches)} books matched out of {len(title_counts)} clipping titles")
     return matches
 
 # --- FILE PARSING ---
 
 def validate_file_size(filepath: str, max_size_mb: int = MAX_BOOK_SIZE_MB) -> bool:
     """Validate that file size is reasonable."""
-    size_mb = os.path.getsize(filepath) / (1024 * 1024)
-    logger.debug(f"File size: {size_mb:.2f}MB")
-    if size_mb > max_size_mb:
-        logger.warning(f"File is large ({size_mb:.2f}MB). This may take a while...")
-    return True
+    try:
+        size_mb = os.path.getsize(filepath) / (1024 * 1024)
+        logger.debug(f"File size: {size_mb:.2f}MB")
+        if size_mb > max_size_mb:
+            logger.warning(f"File is large ({size_mb:.2f}MB). This may take a while...")
+        return True
+    except Exception as e:
+        logger.error(f"Could not check file size: {e}")
+        return False
 
 def parse_clippings(clippings_file: str) -> List[Dict[str, str]]:
     """Parses the 'My Clippings.txt' file and returns a list of clippings."""
@@ -448,11 +501,14 @@ def parse_clippings(clippings_file: str) -> List[Dict[str, str]]:
     
     logger.info(f"Parsing clippings from: {clippings_file}")
     
-    file_size = os.path.getsize(clippings_file) / (1024 * 1024)
-    logger.debug(f"Clippings file size: {file_size:.2f}MB")
-    
-    if file_size > 10:
-        logger.info(f"Large clippings file ({file_size:.2f}MB). This may take a moment...")
+    try:
+        file_size = os.path.getsize(clippings_file) / (1024 * 1024)
+        logger.debug(f"Clippings file size: {file_size:.2f}MB")
+        
+        if file_size > 10:
+            logger.info(f"Large clippings file ({file_size:.2f}MB). This may take a moment...")
+    except Exception as e:
+        logger.debug(f"Could not check file size: {e}")
     
     encodings = ['utf-8-sig', 'utf-8', 'latin-1', 'cp1252']
     content = None
@@ -462,10 +518,13 @@ def parse_clippings(clippings_file: str) -> List[Dict[str, str]]:
         try:
             with open(clippings_file, 'r', encoding=encoding) as f:
                 content = f.read()
-            logger.debug(f"Successfully read file with {encoding} encoding")
+            logger.debug(f"✓ Successfully read file with {encoding} encoding")
             break
         except UnicodeDecodeError:
-            logger.debug(f"Failed to read with {encoding} encoding")
+            logger.debug(f"✗ Failed to read with {encoding} encoding")
+            continue
+        except Exception as e:
+            logger.debug(f"Unexpected error with {encoding}: {e}")
             continue
     
     if content is None:
@@ -476,7 +535,7 @@ def parse_clippings(clippings_file: str) -> List[Dict[str, str]]:
     
     clippings = []
     entries = content.split('==========')
-    logger.debug(f"Found {len(entries)} potential entries")
+    logger.debug(f"Found {len(entries)} potential entries (split by '==========')")
     
     highlight_patterns = [
         r'^-\s*Your\s+(Highlight|Note)',
@@ -488,6 +547,11 @@ def parse_clippings(clippings_file: str) -> List[Dict[str, str]]:
     
     logger.debug(f"Using {len(highlight_patterns)} language patterns for detection")
     
+    skipped_no_lines = 0
+    skipped_not_highlight = 0
+    skipped_no_text = 0
+    skipped_too_short = 0
+    
     for idx, entry in enumerate(entries):
         if idx % 100 == 0 and idx > 0:
             logger.debug(f"Processing entry {idx}/{len(entries)}")
@@ -498,7 +562,9 @@ def parse_clippings(clippings_file: str) -> List[Dict[str, str]]:
         
         lines = entry.split('\n')
         if len(lines) < 3:
-            logger.debug(f"Skipping entry {idx}: too few lines ({len(lines)})")
+            skipped_no_lines += 1
+            if idx < 10:
+                logger.debug(f"Skipping entry {idx}: too few lines ({len(lines)})")
             continue
         
         book_title = ''.join(char for char in lines[0].strip() if char.isprintable())
@@ -512,12 +578,13 @@ def parse_clippings(clippings_file: str) -> List[Dict[str, str]]:
                 break
         
         if not is_highlight:
+            skipped_not_highlight += 1
             if idx < 10:
                 logger.debug(f"Skipping entry {idx}: line 2 doesn't match any pattern: {lines[1][:80]}")
             continue
         
         if idx < 10:
-            logger.debug(f"Entry {idx} matched pattern: {matched_pattern}")
+            logger.debug(f"✓ Entry {idx} matched pattern: {matched_pattern}")
         
         clipping_text = None
         for i in range(2, len(lines)):
@@ -526,15 +593,20 @@ def parse_clippings(clippings_file: str) -> List[Dict[str, str]]:
                 break
         
         if not clipping_text:
+            skipped_no_text += 1
             logger.debug(f"Skipping entry {idx}: no highlight text found")
             continue
         
         if len(clipping_text) >= MIN_HIGHLIGHT_LENGTH:
             clippings.append({'title': book_title, 'text': clipping_text})
             if idx < 10:
-                logger.debug(f"Added highlight from '{book_title}': {clipping_text[:50]}...")
+                logger.debug(f"✓ Added highlight from '{book_title}': {clipping_text[:50]}...")
         else:
+            skipped_too_short += 1
             logger.debug(f"Skipping entry {idx}: highlight too short ({len(clipping_text)} chars)")
+    
+    logger.debug(f"Parsing stats: skipped {skipped_no_lines} (no lines), {skipped_not_highlight} (not highlight), "
+                 f"{skipped_no_text} (no text), {skipped_too_short} (too short)")
     
     if not clippings:
         logger.error("No valid clippings were found in the provided file.")
@@ -553,7 +625,7 @@ def parse_clippings(clippings_file: str) -> List[Dict[str, str]]:
         for clip in clippings:
             title_counts[clip['title']] = title_counts.get(clip['title'], 0) + 1
         
-        logger.debug("\nBooks found in clippings:")
+        logger.debug("\nBooks found in clippings (top 10 by highlight count):")
         for title, count in sorted(title_counts.items(), key=lambda x: x[1], reverse=True)[:10]:
             logger.debug(f"  - {title}: {count} highlights")
         
@@ -573,12 +645,18 @@ def extract_htmlz(htmlz_path: str) -> Tuple[str, str]:
     
     if os.path.exists(extract_dir):
         logger.debug(f"Removing existing extract directory")
-        shutil.rmtree(extract_dir)
+        try:
+            shutil.rmtree(extract_dir)
+        except Exception as e:
+            logger.warning(f"Could not remove existing extract directory: {e}")
     
     try:
         logger.debug("Opening zip archive...")
         with zipfile.ZipFile(htmlz_path, 'r') as zip_ref:
-            logger.debug(f"Extracting {len(zip_ref.namelist())} files...")
+            file_list = zip_ref.namelist()
+            logger.debug(f"Archive contains {len(file_list)} files")
+            if logger.level <= logging.DEBUG and len(file_list) <= 20:
+                logger.debug(f"Files in archive: {file_list}")
             zip_ref.extractall(extract_dir)
         
         html_files = list(Path(extract_dir).rglob('*.html'))
@@ -592,19 +670,21 @@ def extract_htmlz(htmlz_path: str) -> Tuple[str, str]:
             logger.debug(f"Checking HTML file: {html_file.name}")
             if html_file.name.lower() in ['index.html', 'index.htm']:
                 main_html = html_file
-                logger.debug(f"Found index file: {main_html}")
+                logger.debug(f"✓ Found index file: {main_html}")
                 break
         
         if not main_html:
             main_html = html_files[0]
             logger.debug(f"Using first HTML file: {main_html}")
         
-        logger.debug(f"Using HTML file: {main_html}")
+        logger.debug(f"✓ Selected HTML file: {main_html}")
         return str(main_html), extract_dir
     
     except zipfile.BadZipFile:
         handle_error(f"Failed to extract {htmlz_path}. Not a valid zip file.")
     except Exception as e:
+        logger.error(f"Error during extraction: {e}")
+        logger.debug("Full traceback:", exc_info=True)
         handle_error(f"Failed to extract htmlz: {e}")
 
 def convert_ebook_to_html(ebook_path: str, converter_path: str, output_format: str) -> Tuple[str, Optional[str], Optional[str]]:
@@ -629,6 +709,8 @@ def convert_ebook_to_html(ebook_path: str, converter_path: str, output_format: s
     
     try:
         logger.debug(f"Running converter: {converter_path}")
+        logger.debug(f"Command: {converter_path} {ebook_path} {output_path}")
+        
         result = subprocess.run(
             [converter_path, ebook_path, output_path],
             check=True,
@@ -638,7 +720,8 @@ def convert_ebook_to_html(ebook_path: str, converter_path: str, output_format: s
         )
         
         if logger.level <= logging.DEBUG:
-            logger.debug(f"Converter stdout: {result.stdout[:500]}...")
+            if result.stdout:
+                logger.debug(f"Converter stdout: {result.stdout[:500]}...")
             if result.stderr:
                 logger.debug(f"Converter stderr: {result.stderr[:500]}...")
         
@@ -648,7 +731,7 @@ def convert_ebook_to_html(ebook_path: str, converter_path: str, output_format: s
             handle_error("Output file was not created by converter")
         
         output_size = os.path.getsize(output_path)
-        logger.debug(f"Output file size: {output_size} bytes")
+        logger.debug(f"Output file size: {output_size} bytes ({output_size/1024:.1f} KB)")
         
         if output_size < 100:
             handle_error("Generated file is suspiciously small. Conversion may have failed.")
@@ -666,7 +749,12 @@ def convert_ebook_to_html(ebook_path: str, converter_path: str, output_format: s
         handle_error("Conversion timed out. The file may be too large or corrupted.")
     except subprocess.CalledProcessError as e:
         logger.error(f"Converter failed with error:\n{e.stderr}")
+        logger.debug("Full error details:", exc_info=True)
         handle_error("Conversion failed. Check that the file is not DRM-protected.")
+    except Exception as e:
+        logger.error(f"Unexpected error during conversion: {e}")
+        logger.debug("Full traceback:", exc_info=True)
+        handle_error(f"Conversion failed: {e}")
 
 def try_native_conversion(ebook_path: str) -> Tuple[Optional[str], None, None]:
     """Attempt to convert using native Python libraries as fallback."""
@@ -687,6 +775,7 @@ def try_native_conversion(ebook_path: str) -> Tuple[Optional[str], None, None]:
         logger.debug("mobi library not available (install: pip install mobi)")
     except Exception as e:
         logger.debug(f"mobi library failed: {e}")
+        logger.debug("mobi exception details:", exc_info=True)
     
     try:
         logger.debug("Trying ebooklib...")
@@ -719,6 +808,7 @@ def try_native_conversion(ebook_path: str) -> Tuple[Optional[str], None, None]:
         logger.debug("ebooklib not available (install: pip install ebooklib)")
     except Exception as e:
         logger.debug(f"ebooklib conversion failed: {e}")
+        logger.debug("ebooklib exception details:", exc_info=True)
     
     logger.error("All native conversion methods failed")
     logger.error("Install native converters: pip install mobi ebooklib")
@@ -729,7 +819,7 @@ def find_book_highlights(ebook_title: str, all_clippings: List[Dict[str, str]]) 
     clipping_titles = list(set(c['title'] for c in all_clippings))
     
     logger.debug(f"Searching among {len(clipping_titles)} unique book titles")
-    logger.debug(f"Ebook title to match: {ebook_title}")
+    logger.debug(f"Ebook title to match: '{ebook_title}'")
     
     result = fuzzy_process.extractOne(ebook_title, clipping_titles)
     if result is None:
@@ -761,7 +851,115 @@ def find_book_highlights(ebook_title: str, all_clippings: List[Dict[str, str]]) 
     logger.debug(f"Returning {len(unique_highlights)} unique highlights")
     return unique_highlights
 
-# --- MATCHER IMPLEMENTATIONS ---
+# --- TEXT EXTRACTION WITH FORMATTING ---
+
+def extract_text_with_formatting(soup: BeautifulSoup) -> Tuple[str, List[int], List[Dict]]:
+    """
+    Extract text while preserving paragraph boundaries and inline formatting.
+    Returns: (full_text, paragraph_break_positions, formatting_spans)
+    formatting_spans = [{'start': int, 'end': int, 'type': str, 'data': any}, ...]
+    """
+    logger.debug("Extracting text with structure and formatting preservation...")
+    
+    text_parts = []
+    para_breaks = []
+    formatting_spans = []
+    
+    # Find main content area
+    main_content = soup.find('body')
+    if not main_content:
+        main_content = soup
+        logger.debug("No <body> tag found, using whole document")
+    
+    # Track character position in the output text
+    char_pos = 0
+    
+    # Process block-level elements
+    block_elements = main_content.find_all(['p', 'div', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'blockquote', 'pre'])
+    
+    if not block_elements:
+        logger.debug("No block elements found, using simple text extraction")
+        return soup.get_text(), [], []
+    
+    logger.debug(f"Processing {len(block_elements)} block elements")
+    
+    processed_count = 0
+    for block_elem in block_elements:
+        processed_count += 1
+        if processed_count % 100 == 0:
+            logger.debug(f"Processed {processed_count}/{len(block_elements)} block elements")
+        
+        # Extract text from this block with inline formatting
+        block_start_pos = char_pos
+        
+        for element in block_elem.descendants:
+            if isinstance(element, NavigableString):
+                text = str(element)
+                if text.strip():  # Only process non-empty text
+                    text_parts.append(text)
+                    text_start = char_pos
+                    char_pos += len(text)
+                    text_end = char_pos
+                    
+                    # Check parent for formatting
+                    parent = element.parent
+                    while parent and parent != block_elem:
+                        if parent.name in ['b', 'strong']:
+                            formatting_spans.append({
+                                'start': text_start,
+                                'end': text_end,
+                                'type': 'bold'
+                            })
+                            logger.debug(f"Bold: {text_start}-{text_end}")
+                        elif parent.name in ['i', 'em']:
+                            formatting_spans.append({
+                                'start': text_start,
+                                'end': text_end,
+                                'type': 'italic'
+                            })
+                            logger.debug(f"Italic: {text_start}-{text_end}")
+                        elif parent.name == 'u':
+                            formatting_spans.append({
+                                'start': text_start,
+                                'end': text_end,
+                                'type': 'underline'
+                            })
+                            logger.debug(f"Underline: {text_start}-{text_end}")
+                        elif parent.name == 'a' and parent.get('href'):
+                            formatting_spans.append({
+                                'start': text_start,
+                                'end': text_end,
+                                'type': 'link',
+                                'data': parent.get('href')
+                            })
+                            logger.debug(f"Link: {text_start}-{text_end} -> {parent.get('href')}")
+                        elif parent.name in ['sup', 'sub']:
+                            formatting_spans.append({
+                                'start': text_start,
+                                'end': text_end,
+                                'type': 'superscript' if parent.name == 'sup' else 'subscript'
+                            })
+                            logger.debug(f"{parent.name}: {text_start}-{text_end}")
+                        
+                        parent = parent.parent
+        
+        # Add paragraph break after this block
+        if char_pos > block_start_pos:  # Only if we added text
+            text_parts.append('\n\n')
+            para_breaks.append(char_pos)
+            char_pos += 2
+    
+    full_text = ''.join(text_parts)
+    logger.debug(f"✓ Extracted {len(full_text)} characters with {len(para_breaks)} paragraph breaks and {len(formatting_spans)} formatting spans")
+    
+    if logger.level <= logging.DEBUG and formatting_spans:
+        bold_count = sum(1 for f in formatting_spans if f['type'] == 'bold')
+        italic_count = sum(1 for f in formatting_spans if f['type'] == 'italic')
+        underline_count = sum(1 for f in formatting_spans if f['type'] == 'underline')
+        link_count = sum(1 for f in formatting_spans if f['type'] == 'link')
+        logger.debug(f"Formatting stats: {bold_count} bold, {italic_count} italic, {underline_count} underline, {link_count} links")
+    
+    return full_text, para_breaks, formatting_spans
 
 def create_highlighted_docx(
     html_path: str,
@@ -770,22 +968,29 @@ def create_highlighted_docx(
     matcher_func: Callable,
     threshold: float
 ) -> Tuple[Document, int]:
-    """Generic function to create a docx file using a provided matcher."""
+    """Create a docx file with highlights and preserved formatting."""
     logger.info(f"🔍 Searching for {len(highlights)} highlights using '{matcher_func.__name__}' method...")
     logger.debug(f"HTML path: {html_path}")
     logger.debug(f"Threshold: {threshold}")
     
     logger.debug("Reading and parsing HTML file...")
-    with open(html_path, 'r', encoding='utf-8') as f:
-        soup = BeautifulSoup(f, 'html.parser')
+    try:
+        with open(html_path, 'r', encoding='utf-8') as f:
+            soup = BeautifulSoup(f, 'html.parser')
+    except Exception as e:
+        logger.error(f"Failed to read HTML file: {e}")
+        logger.debug("Full traceback:", exc_info=True)
+        handle_error(f"Could not read HTML file: {e}")
 
-    logger.debug("Extracting text from HTML...")
-    full_text_raw = soup.get_text()
+    logger.debug("Extracting text with structure and formatting preservation...")
+    full_text_raw, para_breaks, formatting_spans = extract_text_with_formatting(soup)
     
     if not full_text_raw or len(full_text_raw) < 100:
         handle_error("Extracted text from HTML is empty or too short. The book may be DRM-protected or corrupted.")
     
     logger.debug(f"Book text length: {len(full_text_raw)} characters")
+    logger.debug(f"Paragraph breaks: {len(para_breaks)}")
+    logger.debug(f"Formatting spans: {len(formatting_spans)}")
     logger.debug(f"First 200 chars: {full_text_raw[:200]}...")
     
     logger.debug("Starting highlight matching...")
@@ -805,25 +1010,114 @@ def create_highlighted_docx(
     logger.debug(f"Sorting {len(found_spans)} found spans...")
     found_spans.sort()
 
-    logger.debug("Creating Word document...")
+    logger.debug("Creating Word document with preserved structure and formatting...")
     doc = Document()
     doc.add_heading(doc_title, level=1)
-    current_pos = 0
-    p = doc.add_paragraph()
-
-    logger.debug("Adding text and highlights to document...")
-    for idx, (start, end) in enumerate(found_spans):
-        if idx % 10 == 0 and logger.level <= logging.DEBUG:
-            logger.debug(f"Processing span {idx+1}/{len(found_spans)}")
+    
+    # Create lookup sets for fast access
+    highlighted_chars = set()
+    for start, end in found_spans:
+        highlighted_chars.update(range(start, end))
+    
+    para_break_set = set(para_breaks)
+    
+    # Build formatting map: char_pos -> [list of formatting dicts]
+    formatting_map = {}
+    for fmt in formatting_spans:
+        for pos in range(fmt['start'], fmt['end']):
+            if pos not in formatting_map:
+                formatting_map[pos] = []
+            formatting_map[pos].append(fmt)
+    
+    logger.debug(f"Built formatting map for {len(formatting_map)} character positions")
+    
+    current_paragraph = doc.add_paragraph()
+    current_run_text = []
+    current_run_highlighted = False
+    current_run_formatting = set()  # Track active formatting for current run
+    
+    logger.debug("Adding text with highlights, paragraph breaks, and formatting...")
+    
+    chars_processed = 0
+    for i, char in enumerate(full_text_raw):
+        chars_processed += 1
+        if chars_processed % 10000 == 0:
+            logger.debug(f"Processed {chars_processed}/{len(full_text_raw)} characters")
         
-        p.add_run(full_text_raw[current_pos:start])
-        highlighted_run = p.add_run(full_text_raw[start:end])
-        highlighted_run.font.highlight_color = WD_COLOR_INDEX.YELLOW
-        current_pos = end
-
-    p.add_run(full_text_raw[current_pos:])
-    logger.debug("Document creation complete")
+        is_highlighted = i in highlighted_chars
+        char_formatting = set()
+        
+        # Get formatting for this character
+        if i in formatting_map:
+            for fmt in formatting_map[i]:
+                char_formatting.add((fmt['type'], fmt.get('data')))
+        
+        # Check if we need to start a new paragraph
+        if i in para_break_set:
+            # Flush current run
+            if current_run_text:
+                text = ''.join(current_run_text)
+                run = current_paragraph.add_run(text)
+                if current_run_highlighted:
+                    run.font.highlight_color = WD_COLOR_INDEX.YELLOW
+                # Apply formatting
+                for fmt_type, fmt_data in current_run_formatting:
+                    if fmt_type == 'bold':
+                        run.bold = True
+                    elif fmt_type == 'italic':
+                        run.italic = True
+                    elif fmt_type == 'underline':
+                        run.underline = True
+                current_run_text = []
+            
+            # Start new paragraph
+            current_paragraph = doc.add_paragraph()
+            if char == '\n' and i + 1 < len(full_text_raw) and full_text_raw[i + 1] == '\n':
+                continue  # Skip the paragraph break markers
+            continue
+        
+        # If highlight status or formatting changes, flush current run and start new one
+        if current_run_text and (is_highlighted != current_run_highlighted or char_formatting != current_run_formatting):
+            text = ''.join(current_run_text)
+            run = current_paragraph.add_run(text)
+            if current_run_highlighted:
+                run.font.highlight_color = WD_COLOR_INDEX.YELLOW
+            # Apply formatting
+            for fmt_type, fmt_data in current_run_formatting:
+                if fmt_type == 'bold':
+                    run.bold = True
+                elif fmt_type == 'italic':
+                    run.italic = True
+                elif fmt_type == 'underline':
+                    run.underline = True
+            
+            current_run_text = []
+            current_run_highlighted = is_highlighted
+            current_run_formatting = char_formatting
+        
+        current_run_text.append(char)
+        if not current_run_text or len(current_run_text) == 1:
+            current_run_highlighted = is_highlighted
+            current_run_formatting = char_formatting
+    
+    # Flush final run
+    if current_run_text:
+        text = ''.join(current_run_text)
+        run = current_paragraph.add_run(text)
+        if current_run_highlighted:
+            run.font.highlight_color = WD_COLOR_INDEX.YELLOW
+        for fmt_type, fmt_data in current_run_formatting:
+            if fmt_type == 'bold':
+                run.bold = True
+            elif fmt_type == 'italic':
+                run.italic = True
+            elif fmt_type == 'underline':
+                run.underline = True
+    
+    logger.debug("✓ Document creation complete")
     return doc, highlights_found
+
+# --- MATCHER IMPLEMENTATIONS ---
 
 def regex_matcher(book_text: str, highlights: List[str]) -> Tuple[List[Tuple[int, int]], int]:
     """Finds highlights using flexible regular expressions."""
@@ -846,13 +1140,17 @@ def regex_matcher(book_text: str, highlights: List[str]) -> Tuple[List[Tuple[int
                 start, end = match.span()
                 if not any(max(start, s) < min(end, e) for s, e in found_spans):
                     found_spans.append((start, end))
-                    logger.debug(f"Match found at position {start}-{end}")
+                    if idx < 5:
+                        logger.debug(f"✓ Match found at position {start}-{end}")
                     break
         except re.error as e:
             logger.debug(f"Regex error for pattern: {e}")
             continue
+        except Exception as e:
+            logger.debug(f"Unexpected error in regex matching: {e}")
+            continue
     
-    logger.debug(f"Regex matching complete. Found {len(found_spans)} matches")
+    logger.debug(f"✓ Regex matching complete. Found {len(found_spans)} matches")
     return found_spans, len(found_spans)
 
 def difflib_matcher(book_text: str, highlights: List[str], threshold: float) -> Tuple[List[Tuple[int, int]], int]:
@@ -875,24 +1173,29 @@ def difflib_matcher(book_text: str, highlights: List[str], threshold: float) -> 
         if not normalized_highlight:
             continue
 
-        matcher = SequenceMatcher(None, normalized_book_text, normalized_highlight)
-        match = matcher.find_longest_match(0, len(normalized_book_text), 0, len(normalized_highlight))
-        
-        similarity = match.size / len(normalized_highlight) if len(normalized_highlight) > 0 else 0
-        
-        if idx < 5:
-            logger.debug(f"Highlight {idx}: similarity = {similarity:.3f}")
-        
-        if similarity >= threshold:
-            start = match.a
-            end = match.a + len(text)
-            end = min(end, len(book_text))
+        try:
+            matcher = SequenceMatcher(None, normalized_book_text, normalized_highlight)
+            match = matcher.find_longest_match(0, len(normalized_book_text), 0, len(normalized_highlight))
             
-            if not any(max(start, s) < min(end, e) for s, e in found_spans):
-                found_spans.append((start, end))
-                logger.debug(f"Match found with {similarity:.2%} similarity at position {start}-{end}")
+            similarity = match.size / len(normalized_highlight) if len(normalized_highlight) > 0 else 0
+            
+            if idx < 5:
+                logger.debug(f"Highlight {idx}: similarity = {similarity:.3f}, match_size = {match.size}")
+            
+            if similarity >= threshold:
+                start = match.a
+                end = match.a + len(text)
+                end = min(end, len(book_text))
+                
+                if not any(max(start, s) < min(end, e) for s, e in found_spans):
+                    found_spans.append((start, end))
+                    if idx < 5:
+                        logger.debug(f"✓ Match found with {similarity:.2%} similarity at position {start}-{end}")
+        except Exception as e:
+            logger.debug(f"Error matching highlight {idx}: {e}")
+            continue
     
-    logger.debug(f"Difflib matching complete. Found {len(found_spans)} matches")
+    logger.debug(f"✓ Difflib matching complete. Found {len(found_spans)} matches")
     return found_spans, len(found_spans)
 
 def vector_matcher(book_text: str, highlights: List[str], threshold: float) -> Tuple[List[Tuple[int, int]], int]:
@@ -908,49 +1211,78 @@ def vector_matcher(book_text: str, highlights: List[str], threshold: float) -> T
     logger.debug("Checking for NLTK punkt tokenizer...")
     try:
         nltk.data.find('tokenizers/punkt')
-        logger.debug("punkt tokenizer found")
+        logger.debug("✓ punkt tokenizer found")
     except LookupError:
         logger.info("Downloading NLTK 'punkt' tokenizer...")
-        nltk.download('punkt', quiet=True)
-        logger.debug("punkt tokenizer downloaded")
+        try:
+            nltk.download('punkt', quiet=True)
+            logger.debug("✓ punkt tokenizer downloaded")
+        except Exception as e:
+            logger.error(f"Failed to download punkt tokenizer: {e}")
+            handle_error("Could not download required NLTK data")
     
     logger.info(f"Loading sentence transformer model: {NLP_MODEL}")
-    model = SentenceTransformer(NLP_MODEL)
-    logger.debug(f"Model loaded: {type(model)}")
+    try:
+        model = SentenceTransformer(NLP_MODEL)
+        logger.debug(f"✓ Model loaded: {type(model)}")
+    except Exception as e:
+        logger.error(f"Failed to load model: {e}")
+        logger.debug("Full traceback:", exc_info=True)
+        handle_error(f"Could not load NLP model: {e}")
     
     logger.info("Tokenizing book text into sentences...")
-    book_sentences = nltk.sent_tokenize(book_text)
-    logger.debug(f"Book split into {len(book_sentences)} sentences")
+    try:
+        book_sentences = nltk.sent_tokenize(book_text)
+        logger.debug(f"✓ Book split into {len(book_sentences)} sentences")
+    except Exception as e:
+        logger.error(f"Failed to tokenize text: {e}")
+        logger.debug("Full traceback:", exc_info=True)
+        handle_error(f"Could not tokenize book text: {e}")
     
     if len(book_sentences) > 10000:
-        logger.warning(f"Large number of sentences ({len(book_sentences)}). This may take a while...")
+        logger.warning(f"Large number of sentences ({len(book_sentences)}). This may take several minutes...")
     
     logger.info("Encoding book sentences...")
-    logger.debug(f"Encoding {len(book_sentences)} sentences with batch_size=32")
-    book_embeddings = model.encode(
-        book_sentences,
-        convert_to_tensor=True,
-        show_progress_bar=logger.level <= logging.INFO,
-        normalize_embeddings=True,
-        batch_size=32
-    )
-    logger.debug(f"Book embeddings shape: {book_embeddings.shape}")
+    try:
+        logger.debug(f"Encoding {len(book_sentences)} sentences with batch_size=32")
+        book_embeddings = model.encode(
+            book_sentences,
+            convert_to_tensor=True,
+            show_progress_bar=logger.level <= logging.INFO,
+            normalize_embeddings=True,
+            batch_size=32
+        )
+        logger.debug(f"✓ Book embeddings shape: {book_embeddings.shape}")
+    except Exception as e:
+        logger.error(f"Failed to encode book sentences: {e}")
+        logger.debug("Full traceback:", exc_info=True)
+        handle_error(f"Could not encode book text: {e}")
     
     logger.info("Encoding highlights...")
-    logger.debug(f"Encoding {len(highlights)} highlights")
-    highlight_embeddings = model.encode(
-        highlights,
-        convert_to_tensor=True,
-        show_progress_bar=logger.level <= logging.INFO,
-        normalize_embeddings=True,
-        batch_size=32
-    )
-    logger.debug(f"Highlight embeddings shape: {highlight_embeddings.shape}")
+    try:
+        logger.debug(f"Encoding {len(highlights)} highlights")
+        highlight_embeddings = model.encode(
+            highlights,
+            convert_to_tensor=True,
+            show_progress_bar=logger.level <= logging.INFO,
+            normalize_embeddings=True,
+            batch_size=32
+        )
+        logger.debug(f"✓ Highlight embeddings shape: {highlight_embeddings.shape}")
+    except Exception as e:
+        logger.error(f"Failed to encode highlights: {e}")
+        logger.debug("Full traceback:", exc_info=True)
+        handle_error(f"Could not encode highlights: {e}")
 
     logger.info("Computing similarity scores...")
-    logger.debug("Running cosine similarity...")
-    cosine_scores = util.cos_sim(highlight_embeddings, book_embeddings)
-    logger.debug(f"Cosine scores shape: {cosine_scores.shape}")
+    try:
+        logger.debug("Running cosine similarity...")
+        cosine_scores = util.cos_sim(highlight_embeddings, book_embeddings)
+        logger.debug(f"✓ Cosine scores shape: {cosine_scores.shape}")
+    except Exception as e:
+        logger.error(f"Failed to compute similarity: {e}")
+        logger.debug("Full traceback:", exc_info=True)
+        handle_error(f"Could not compute similarity scores: {e}")
     
     found_spans = []
     
@@ -958,37 +1290,43 @@ def vector_matcher(book_text: str, highlights: List[str], threshold: float) -> T
         if i % 10 == 0 and logger.level <= logging.DEBUG:
             logger.debug(f"Processing highlight {i+1}/{len(highlights)}")
         
-        best_match_idx = cosine_scores[i].argmax().item()
-        confidence = cosine_scores[i][best_match_idx].item()
-        
-        if i < 5 or logger.level <= logging.DEBUG:
-            logger.debug(f"Highlight {i+1}: best match sentence {best_match_idx}, confidence = {confidence:.3f}")
-        
-        if confidence > threshold:
-            sentence = book_sentences[best_match_idx]
-            search_start = book_text.find(sentence)
+        try:
+            best_match_idx = cosine_scores[i].argmax().item()
+            confidence = cosine_scores[i][best_match_idx].item()
             
-            if search_start != -1:
-                search_end = search_start + len(sentence) + int(len(text) * 0.3)
-                search_end = min(search_end, len(book_text))
-                search_span = book_text[search_start:search_end]
+            if i < 5 or (i % 100 == 0 and logger.level <= logging.DEBUG):
+                logger.debug(f"Highlight {i+1}: best match sentence {best_match_idx}, confidence = {confidence:.3f}")
+            
+            if confidence > threshold:
+                sentence = book_sentences[best_match_idx]
+                search_start = book_text.find(sentence)
                 
-                matcher = SequenceMatcher(None, search_span, text, autojunk=False)
-                match = matcher.find_longest_match(0, len(search_span), 0, len(text))
-                
-                final_start = search_start + match.a
-                final_end = final_start + match.size
-                
-                if not any(max(final_start, s) < min(final_end, e) for s, e in found_spans):
-                    found_spans.append((final_start, final_end))
-                    logger.debug(f"Match added at position {final_start}-{final_end}")
+                if search_start != -1:
+                    search_end = search_start + len(sentence) + int(len(text) * 0.3)
+                    search_end = min(search_end, len(book_text))
+                    search_span = book_text[search_start:search_end]
+                    
+                    matcher = SequenceMatcher(None, search_span, text, autojunk=False)
+                    match = matcher.find_longest_match(0, len(search_span), 0, len(text))
+                    
+                    final_start = search_start + match.a
+                    final_end = final_start + match.size
+                    
+                    if not any(max(final_start, s) < min(final_end, e) for s, e in found_spans):
+                        found_spans.append((final_start, final_end))
+                        if i < 5:
+                            logger.debug(f"✓ Match added at position {final_start}-{final_end}")
+                else:
+                    if i < 5:
+                        logger.debug(f"Could not find sentence in book text")
             else:
-                logger.debug(f"Could not find sentence in book text")
-        else:
-            if i < 5:
-                logger.debug(f"Highlight {i+1}: confidence too low ({confidence:.3f} < {threshold})")
+                if i < 5:
+                    logger.debug(f"Highlight {i+1}: confidence too low ({confidence:.3f} < {threshold})")
+        except Exception as e:
+            logger.debug(f"Error processing highlight {i}: {e}")
+            continue
     
-    logger.debug(f"Vector matching complete. Found {len(found_spans)} matches")
+    logger.debug(f"✓ Vector matching complete. Found {len(found_spans)} matches")
     return found_spans, len(found_spans)
 
 # --- SINGLE BOOK PROCESSING ---
@@ -1009,6 +1347,7 @@ def process_single_book(
     Process a single book and return results.
     Returns dict with: success, output_path, highlights_found, highlights_total, error
     """
+    logger.debug(f"Starting process_single_book for: {ebook_path}")
     result = {
         'success': False,
         'ebook_path': str(ebook_path),
@@ -1023,27 +1362,35 @@ def process_single_book(
     extract_dir = None
     
     try:
-        # Convert ebook - FIXED: was html_path, now html_file
+        # Convert ebook
+        logger.debug("Converting ebook to HTML...")
         html_file, intermediate_file, extract_dir = convert_ebook_to_html(
             str(ebook_path), converter_path, output_format
         )
         
-        # Extract title - FIXED: was html_path, now html_file
-        logger.debug(f"Reading HTML file: {html_file}")
-        with open(html_file, 'r', encoding='utf-8') as f:
-            soup = BeautifulSoup(f, 'html.parser')
-            doc_title = soup.title.string.strip() if soup.title and soup.title.string else os.path.basename(ebook_path)
+        # Extract title
+        logger.debug(f"Reading HTML file for title extraction: {html_file}")
+        try:
+            with open(html_file, 'r', encoding='utf-8') as f:
+                soup = BeautifulSoup(f, 'html.parser')
+                doc_title = soup.title.string.strip() if soup.title and soup.title.string else os.path.basename(ebook_path)
+        except Exception as e:
+            logger.warning(f"Could not extract title from HTML: {e}")
+            doc_title = os.path.basename(ebook_path)
         
-        logger.debug(f"Document title: {doc_title}")
+        logger.debug(f"Document title: '{doc_title}'")
         
         # Find highlights
+        logger.debug("Finding highlights for this book...")
         relevant_highlights = find_book_highlights(doc_title, all_clippings)
         
         if not relevant_highlights:
             result['error'] = "No highlights found"
+            logger.warning("No highlights found for this book")
             return result
         
         result['highlights_total'] = len(relevant_highlights)
+        logger.debug(f"Found {len(relevant_highlights)} highlights to match")
         
         # --- COMPARE MODE ---
         if compare_mode:
@@ -1063,6 +1410,7 @@ def process_single_book(
                     threshold=0.0
                 )
                 results["Regex"] = f"{count}/{len(relevant_highlights)} ({count/len(relevant_highlights)*100:.1f}%)"
+                logger.debug(f"Regex result: {results['Regex']}")
             except Exception as e:
                 logger.error(f"Regex method failed: {e}")
                 logger.debug(f"Regex exception details:", exc_info=True)
@@ -1077,6 +1425,7 @@ def process_single_book(
                     similarity_threshold
                 )
                 results["Difflib"] = f"{count}/{len(relevant_highlights)} ({count/len(relevant_highlights)*100:.1f}%)"
+                logger.debug(f"Difflib result: {results['Difflib']}")
             except Exception as e:
                 logger.error(f"Difflib method failed: {e}")
                 logger.debug(f"Difflib exception details:", exc_info=True)
@@ -1091,6 +1440,7 @@ def process_single_book(
                     vector_threshold
                 )
                 results["Vector"] = f"{count}/{len(relevant_highlights)} ({count/len(relevant_highlights)*100:.1f}%)"
+                logger.debug(f"Vector result: {results['Vector']}")
             except Exception as e:
                 logger.error(f"Vector method failed: {e}")
                 logger.debug(f"Vector exception details:", exc_info=True)
@@ -1124,6 +1474,7 @@ def process_single_book(
             threshold = vector_threshold
             logger.debug(f"Using vector matcher (threshold: {threshold})")
 
+        logger.debug("Creating highlighted document...")
         doc, found_count = create_highlighted_docx(
             html_file,
             relevant_highlights,
@@ -1133,6 +1484,7 @@ def process_single_book(
         )
         
         result['highlights_found'] = found_count
+        logger.debug(f"Found {found_count} highlights")
         
         # Save document
         if not output_path:
@@ -1140,8 +1492,15 @@ def process_single_book(
         
         logger.debug(f"Output path: {output_path}")
         logger.info(f"💾 Saving document to: {output_path}")
-        doc.save(output_path)
-        logger.debug("Document saved successfully")
+        
+        try:
+            doc.save(output_path)
+            logger.debug("✓ Document saved successfully")
+        except Exception as e:
+            logger.error(f"Failed to save document: {e}")
+            logger.debug("Full traceback:", exc_info=True)
+            result['error'] = f"Failed to save document: {e}"
+            return result
         
         result['success'] = True
         result['output_path'] = output_path
@@ -1154,28 +1513,35 @@ def process_single_book(
     finally:
         # Cleanup
         if not keep_html:
+            logger.debug("Cleaning up intermediate files...")
             if html_file and os.path.exists(html_file):
                 try:
                     os.remove(html_file)
-                    logger.debug(f"Cleaned up: {os.path.basename(html_file)}")
+                    logger.debug(f"✓ Cleaned up: {os.path.basename(html_file)}")
                 except Exception as e:
                     logger.debug(f"Failed to clean up {html_file}: {e}")
             
             if extract_dir and os.path.exists(extract_dir):
                 try:
                     shutil.rmtree(extract_dir)
-                    logger.debug(f"Cleaned up extracted directory: {extract_dir}")
+                    logger.debug(f"✓ Cleaned up extracted directory: {extract_dir}")
                 except Exception as e:
                     logger.debug(f"Failed to clean up {extract_dir}: {e}")
             
             if intermediate_file and os.path.exists(intermediate_file):
                 try:
                     os.remove(intermediate_file)
-                    logger.debug(f"Cleaned up: {os.path.basename(intermediate_file)}")
+                    logger.debug(f"✓ Cleaned up: {os.path.basename(intermediate_file)}")
                 except Exception as e:
                     logger.debug(f"Failed to clean up {intermediate_file}: {e}")
         else:
-            logger.debug("Keeping intermediate files (--keep-html)")
+            logger.info(f"Keeping intermediate files (--preserve-html):")
+            if html_file:
+                logger.info(f"  - HTML: {html_file}")
+            if intermediate_file:
+                logger.info(f"  - Archive: {intermediate_file}")
+            if extract_dir:
+                logger.info(f"  - Extract dir: {extract_dir}")
     
     return result
 
@@ -1183,44 +1549,51 @@ def process_single_book(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate Word documents with Kindle highlights - WITH BATCH MODE",
+        description="Generate Word documents with Kindle highlights - LIBRARY BATCH MODE BY DEFAULT",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  Process ALL books with highlights (batch mode):
-    python kindle_highlighter.py --library --clippings "My Clippings.txt" --batch -v
+  Default: Process ALL books from library with 95%+ match confidence:
+    python kindle_highlighter.py --clippings "My Clippings.txt" -v
   
-  Process only the best matching book:
-    python kindle_highlighter.py --library --clippings "My Clippings.txt" -v
+  Process only the best matching book from library:
+    python kindle_highlighter.py --clippings "My Clippings.txt" --no-batch -v
   
-  Compare all methods on a single book:
+  Process specific ebook file:
+    python kindle_highlighter.py --ebook book.mobi --clippings "My Clippings.txt" -v
+  
+  Batch mode with HTML files preserved for debugging:
+    python kindle_highlighter.py --clippings "My Clippings.txt" --preserve-html -vv
+  
+  Compare all methods on a specific file:
     python kindle_highlighter.py --ebook book.mobi --clippings "My Clippings.txt" --compare -v
   
-  List all books:
+  List all books in library:
     python kindle_highlighter.py --list-books
+
+Note: Library batch mode is enabled by default. Use --no-batch to process only 
+      the single best match, or --ebook to process a specific file.
         """
     )
     
     # Mode selection
     mode_group = parser.add_mutually_exclusive_group()
-    mode_group.add_argument("--library", action="store_true", 
-                           help="Process book(s) from Calibre Library.")
     mode_group.add_argument("--list-books", action="store_true", 
                            help="List all books in Calibre Library and exit.")
     
     # Direct file mode
     direct_group = parser.add_argument_group('Direct File Mode')
     direct_group.add_argument("--ebook", dest="ebook_file", 
-                             help="Path to a single ebook file.")
+                             help="Path to a single ebook file (overrides library mode).")
     direct_group.add_argument("--clippings", dest="clippings_file", 
-                             help="Path to 'My Clippings.txt'.")
+                             help="Path to 'My Clippings.txt' (required).")
     
-    # Library options
+    # Library options (defaults enabled)
     library_group = parser.add_argument_group('Library Options')
     library_group.add_argument("--library-path", 
                               help=f"Path to Calibre Library (default: {DEFAULT_CALIBRE_LIBRARY})")
-    library_group.add_argument("--batch", action="store_true",
-                              help="Process ALL books with 95%+ match confidence")
+    library_group.add_argument("--no-batch", action="store_true",
+                              help="Process only the single best match instead of all books with 95%+ confidence")
     
     # Converter options
     converter_group = parser.add_argument_group('Converter Options')
@@ -1235,6 +1608,8 @@ Examples:
                              help="Output path (single file mode only)")
     output_group.add_argument("--keep-html", action="store_true", 
                              help="Keep intermediate HTML files")
+    output_group.add_argument("--preserve-html", action="store_true",
+                             help="Same as --keep-html (preserve HTML files for inspection)")
     
     # Matching options
     matching_group = parser.add_argument_group('Matching Options')
@@ -1242,7 +1617,7 @@ Examples:
         "-m", "--method",
         choices=['regex', 'diff', 'vector'],
         default='diff',
-        help="Matching method: regex (fast), diff (balanced), vector (best accuracy)"
+        help="Matching method: regex (fast), diff (balanced, default), vector (best accuracy)"
     )
     matching_group.add_argument("--compare", action="store_true", 
                                help="Run all methods and compare results (single file only)")
@@ -1278,6 +1653,11 @@ Examples:
     logger.debug(f"Command line arguments: {vars(args)}")
     logger.debug(f"Python version: {sys.version}")
     logger.debug(f"Platform: {sys.platform}")
+    
+    # Handle preserve-html alias
+    if args.preserve_html:
+        args.keep_html = True
+        logger.debug("--preserve-html flag set, enabling --keep-html")
     
     # --- LIST BOOKS MODE ---
     if args.list_books:
@@ -1321,8 +1701,9 @@ Examples:
         # Get clippings path
         clippings_path = args.clippings_file
         
-        if args.library and not clippings_path:
-            logger.debug("Library mode: checking for default clippings file")
+        # If no ebook file specified, use library mode by default
+        if not args.ebook_file and not clippings_path:
+            logger.debug("No ebook or clippings specified, checking for defaults...")
             clippings_default = os.path.expanduser('~/Documents/My Clippings.txt')
             if os.path.exists(clippings_default):
                 clippings_path = clippings_default
@@ -1340,15 +1721,15 @@ Examples:
         converter_path, output_format = check_converter_available(args.calibre_path)
         
         if converter_path:
-            pass  # Good!
+            logger.debug(f"Converter available: {converter_path}")
         elif args.try_native:
             logger.warning("No standard converter found. Will try native conversion.")
         else:
             handle_error("No converter available. Install Calibre or use --try-native")
         
-        # --- BATCH MODE (LIBRARY) ---
-        if args.library:
-            logger.debug("Library mode: auto-selecting book(s)")
+        # --- LIBRARY MODE (DEFAULT) ---
+        if not args.ebook_file:
+            logger.debug("Library mode: processing books from Calibre library")
             library_path = find_calibre_library(args.library_path)
             books = discover_books(library_path)
             clipping_titles = [c['title'] for c in all_clippings]
@@ -1357,7 +1738,7 @@ Examples:
             matches = match_books_to_clippings(books, clipping_titles, MIN_TITLE_MATCH_SCORE)
             
             if not matches:
-                handle_error("No matching books found!")
+                handle_error("No matching books found in library!")
             
             # Show matches
             logger.info("\n" + "=" * 80)
@@ -1366,21 +1747,31 @@ Examples:
             for idx, m in enumerate(matches[:20], 1):
                 logger.info(f"{idx:2d}. Score {m['score']:3d}% | {m['highlight_count']:4d} highlights | '{m['book']['title']}'")
                 logger.info(f"     Clipping title: '{m['clipping_title']}'")
+            if len(matches) > 20:
+                logger.info(f"     ... and {len(matches) - 20} more books")
             logger.info("=" * 80)
             
-            # Determine which books to process
-            if args.batch:
-                # Process ALL books with 95%+ match
-                books_to_process = [m for m in matches if m['score'] >= AUTO_SELECT_THRESHOLD]
-                logger.info(f"\n📦 BATCH MODE: Processing {len(books_to_process)} books with {AUTO_SELECT_THRESHOLD}%+ match confidence")
-            else:
+            # Determine which books to process (BATCH BY DEFAULT)
+            if args.no_batch:
                 # Process only the best match
                 if matches[0]['score'] >= AUTO_SELECT_THRESHOLD:
                     books_to_process = [matches[0]]
-                    logger.info(f"\n✓ Auto-selected best match: '{matches[0]['book']['title']}' ({matches[0]['score']}%)")
+                    logger.info(f"\n✓ Processing single best match: '{matches[0]['book']['title']}' ({matches[0]['score']}%)")
+                    high_conf_count = len([m for m in matches if m['score'] >= AUTO_SELECT_THRESHOLD])
+                    if high_conf_count > 1:
+                        logger.info(f"💡 Tip: Remove --no-batch to process all {high_conf_count} books with {AUTO_SELECT_THRESHOLD}%+ match")
                 else:
                     logger.error(f"\n❌ Best match only {matches[0]['score']}% (need {AUTO_SELECT_THRESHOLD}%+)")
-                    logger.error("   Use --batch to process all good matches, or specify with --ebook")
+                    logger.error(f"   Book: '{matches[0]['book']['title']}'")
+                    logger.error("   Try removing --no-batch, or use --ebook for specific file")
+                    sys.exit(1)
+            else:
+                # DEFAULT: Process ALL books with 95%+ match (BATCH MODE)
+                books_to_process = [m for m in matches if m['score'] >= AUTO_SELECT_THRESHOLD]
+                logger.info(f"\n📦 BATCH MODE (default): Processing {len(books_to_process)} books with {AUTO_SELECT_THRESHOLD}%+ match confidence")
+                if len(books_to_process) == 0:
+                    logger.error(f"No books found with {AUTO_SELECT_THRESHOLD}%+ match confidence")
+                    logger.error(f"Best match was {matches[0]['score']}%: '{matches[0]['book']['title']}'")
                     sys.exit(1)
             
             # Process books
@@ -1444,10 +1835,7 @@ Examples:
         # --- SINGLE FILE MODE ---
         else:
             ebook_path = args.ebook_file
-            if not ebook_path:
-                handle_error("An ebook file must be provided with --ebook")
-            
-            logger.debug(f"Ebook path: {ebook_path}")
+            logger.debug(f"Single file mode: processing {ebook_path}")
             
             result = process_single_book(
                 ebook_path,
@@ -1464,7 +1852,7 @@ Examples:
             
             if args.compare:
                 # Results already printed in compare mode
-                pass
+                logger.debug("Compare mode results displayed")
             elif result['success']:
                 pct = (result['highlights_found']/result['highlights_total']*100) if result['highlights_total'] > 0 else 0
                 print("\n" + "=" * 70)
