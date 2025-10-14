@@ -463,7 +463,7 @@ def discover_books(library_path: Path, format_filter: str = 'mobi') -> List[Dict
     
     return books
 
-def match_books_to_clippings(books: List[Dict], clippings_titles: List[str], min_score: int = MIN_TITLE_MATCH_SCORE) -> List[Dict]:
+def match_books_to_clippings(books: List[Dict], all_highlights: List[Dict[str, str]], all_notes: List[Dict[str, str]], min_score: int = MIN_TITLE_MATCH_SCORE) -> List[Dict]:
     """
     Match ALL books from library to clippings.
     Returns list of matched books sorted by score and highlight count.
@@ -471,6 +471,9 @@ def match_books_to_clippings(books: List[Dict], clippings_titles: List[str], min
     if not books:
         logger.warning("No books found in library")
         return []
+    
+    # Combine highlights and notes to get all clipping titles
+    clippings_titles = [h['title'] for h in all_highlights] + [n['title'] for n in all_notes]
     
     if not clippings_titles:
         logger.warning("No clipping titles to match against")
@@ -499,7 +502,6 @@ def match_books_to_clippings(books: List[Dict], clippings_titles: List[str], min
         for book in books:
             book_title_clean = normalize_title_for_matching(book['title'])
             
-            # Use multiple scoring methods
             score1 = fuzz.token_sort_ratio(clip_title_clean.lower(), book_title_clean.lower())
             score2 = fuzz.partial_ratio(clip_title_clean.lower(), book_title_clean.lower())
             score3 = fuzz.ratio(clip_title_clean.lower(), book_title_clean.lower())
@@ -521,10 +523,9 @@ def match_books_to_clippings(books: List[Dict], clippings_titles: List[str], min
                 'method_scores': best_method
             })
             
-            logger.debug(f"'{clip_title_clean}' ({highlight_count} highlights) -> "
+            logger.debug(f"'{clip_title_clean}' ({highlight_count} items) -> "
                         f"'{normalize_title_for_matching(best_book['title'])}' ({best_score}%) [{best_method}]")
     
-    # Sort by: 1) score desc, 2) highlight count desc
     matches.sort(key=lambda x: (x['score'], x['highlight_count']), reverse=True)
     
     logger.debug(f"Match complete: {len(matches)} books matched out of {len(title_counts)} clipping titles")
@@ -544,8 +545,11 @@ def validate_file_size(filepath: str, max_size_mb: int = MAX_BOOK_SIZE_MB) -> bo
         logger.error(f"Could not check file size: {e}")
         return False
 
-def parse_clippings(clippings_file: str) -> List[Dict[str, str]]:
-    """Parses the 'My Clippings.txt' file and returns a list of clippings."""
+def parse_clippings(clippings_file: str) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
+    """
+    Parses the 'My Clippings.txt' file.
+    Returns: (highlights, notes) as separate lists
+    """
     if not os.path.exists(clippings_file):
         handle_error(f"Clippings file not found at: {clippings_file}")
     
@@ -583,22 +587,35 @@ def parse_clippings(clippings_file: str) -> List[Dict[str, str]]:
     logger.debug(f"File content length: {len(content)} characters")
     logger.info("Parsing clippings (this may take a moment for large files)...")
     
-    clippings = []
+    highlights = []
+    notes = []
     entries = content.split('==========')
     logger.debug(f"Found {len(entries)} potential entries (split by '==========')")
     
     highlight_patterns = [
-        r'^-\s*Your\s+(Highlight|Note)',
-        r'^-\s*(Ihre|Deine)\s+(Markierung|Notiz)',
-        r'^-\s*Votre\s+(surlignement|note)',
-        r'^-\s*Tu\s+(subrayado|nota)',
-        r'^-\s*La\s+tua\s+(evidenziazione|nota)',
+        r'^-\s*Your\s+Highlight',
+        r'^-\s*(Ihre|Deine)\s+Markierung',
+        r'^-\s*Votre\s+surlignement',
+        r'^-\s*Tu\s+subrayado',
+        r'^-\s*La\s+tua\s+evidenziazione',
     ]
     
-    logger.debug(f"Using {len(highlight_patterns)} language patterns for detection")
+    note_patterns = [
+        r'^-\s*Your\s+Note',
+        r'^-\s*(Ihre|Deine)\s+Notiz',
+        r'^-\s*Votre\s+note',
+        r'^-\s*Tu\s+nota',
+        r'^-\s*La\s+tua\s+nota',
+    ]
+    
+    logger.debug(f"Using {len(highlight_patterns)} highlight patterns and {len(note_patterns)} note patterns")
+    
+    # Extract location info pattern (works for most Kindle formats)
+    # Example: "- Your Highlight on page 52 | location 789-791 | Added on Wednesday, 1 January 2025 12:00:00"
+    location_pattern = r'(?:page\s+(\d+)|location\s+(\d+)(?:-(\d+))?|Loc\.\s+(\d+)(?:-(\d+))?)'
     
     skipped_no_lines = 0
-    skipped_not_highlight = 0
+    skipped_not_recognized = 0
     skipped_no_text = 0
     skipped_too_short = 0
     
@@ -619,23 +636,43 @@ def parse_clippings(clippings_file: str) -> List[Dict[str, str]]:
         
         book_title = ''.join(char for char in lines[0].strip() if char.isprintable())
         
+        # Extract location information
+        location_info = {}
+        location_match = re.search(location_pattern, lines[1], re.IGNORECASE)
+        if location_match:
+            groups = location_match.groups()
+            if groups[0]:  # page number
+                location_info['page'] = int(groups[0])
+            if groups[1]:  # location start
+                location_info['location_start'] = int(groups[1])
+            if groups[2]:  # location end
+                location_info['location_end'] = int(groups[2])
+            if groups[3]:  # alternative Loc. format start
+                location_info['location_start'] = int(groups[3])
+            if groups[4]:  # alternative Loc. format end
+                location_info['location_end'] = int(groups[4])
+        
+        # Check if it's a note
+        is_note = False
+        for pattern in note_patterns:
+            if re.match(pattern, lines[1].strip(), re.IGNORECASE):
+                is_note = True
+                break
+        
+        # Check if it's a highlight
         is_highlight = False
-        matched_pattern = None
         for pattern in highlight_patterns:
             if re.match(pattern, lines[1].strip(), re.IGNORECASE):
                 is_highlight = True
-                matched_pattern = pattern
                 break
         
-        if not is_highlight:
-            skipped_not_highlight += 1
+        if not is_highlight and not is_note:
+            skipped_not_recognized += 1
             if idx < 10:
-                logger.debug(f"Skipping entry {idx}: line 2 doesn't match any pattern: {lines[1][:80]}")
+                logger.debug(f"Skipping entry {idx}: not recognized as highlight or note: {lines[1][:80]}")
             continue
         
-        if idx < 10:
-            logger.debug(f"✓ Entry {idx} matched pattern: {matched_pattern}")
-        
+        # Extract text
         clipping_text = None
         for i in range(2, len(lines)):
             if lines[i].strip():
@@ -644,45 +681,44 @@ def parse_clippings(clippings_file: str) -> List[Dict[str, str]]:
         
         if not clipping_text:
             skipped_no_text += 1
-            logger.debug(f"Skipping entry {idx}: no highlight text found")
+            logger.debug(f"Skipping entry {idx}: no text found")
             continue
         
-        if len(clipping_text) >= MIN_HIGHLIGHT_LENGTH:
-            clippings.append({'title': book_title, 'text': clipping_text})
-            if idx < 10:
-                logger.debug(f"✓ Added highlight from '{book_title}': {clipping_text[:50]}...")
+        # Add to appropriate list
+        if len(clipping_text) >= MIN_HIGHLIGHT_LENGTH or is_note:  # Notes can be shorter
+            item = {
+                'title': book_title,
+                'text': clipping_text,
+                'location': location_info
+            }
+            
+            if is_highlight:
+                highlights.append(item)
+                if idx < 10:
+                    logger.debug(f"✓ Added highlight from '{book_title}': {clipping_text[:50]}...")
+            else:  # is_note
+                notes.append(item)
+                if idx < 10:
+                    logger.debug(f"✓ Added note from '{book_title}': {clipping_text[:50]}...")
         else:
             skipped_too_short += 1
-            logger.debug(f"Skipping entry {idx}: highlight too short ({len(clipping_text)} chars)")
+            logger.debug(f"Skipping entry {idx}: text too short ({len(clipping_text)} chars)")
     
-    logger.debug(f"Parsing stats: skipped {skipped_no_lines} (no lines), {skipped_not_highlight} (not highlight), "
-                 f"{skipped_no_text} (no text), {skipped_too_short} (too short)")
+    logger.debug(f"Parsing stats: skipped {skipped_no_lines} (no lines), "
+                 f"{skipped_not_recognized} (not recognized), {skipped_no_text} (no text), {skipped_too_short} (too short)")
     
-    if not clippings:
+    if not highlights and not notes:
         logger.error("No valid clippings were found in the provided file.")
         logger.error("The file may not be in the standard Kindle 'My Clippings.txt' format.")
-        logger.error(f"File has {len(entries)} entries separated by '=========='")
-        if entries and len(entries) > 1:
-            logger.error(f"First entry preview:")
-            logger.error(f"{entries[1][:300]}...")
         handle_error("Failed to parse clippings file.")
     
-    unique_titles = len(set(c['title'] for c in clippings))
-    logger.info(f"✓ Found {len(clippings)} total clippings from {unique_titles} books")
+    unique_highlight_titles = len(set(h['title'] for h in highlights))
+    unique_note_titles = len(set(n['title'] for n in notes))
     
-    if logger.level <= logging.DEBUG:
-        title_counts = {}
-        for clip in clippings:
-            title_counts[clip['title']] = title_counts.get(clip['title'], 0) + 1
-        
-        logger.debug("\nBooks found in clippings (top 10 by highlight count):")
-        for title, count in sorted(title_counts.items(), key=lambda x: x[1], reverse=True)[:10]:
-            logger.debug(f"  - {title}: {count} highlights")
-        
-        if len(title_counts) > 10:
-            logger.debug(f"  ... and {len(title_counts) - 10} more books")
+    logger.info(f"✓ Found {len(highlights)} highlights from {unique_highlight_titles} books")
+    logger.info(f"✓ Found {len(notes)} user notes from {unique_note_titles} books")
     
-    return clippings
+    return highlights, notes
 
 # --- CONVERSION FUNCTIONS ---
 
@@ -864,17 +900,20 @@ def try_native_conversion(ebook_path: str) -> Tuple[Optional[str], None, None]:
     logger.error("Install native converters: pip install mobi ebooklib")
     return None, None, None
 
-def find_book_highlights(ebook_title: str, all_clippings: List[Dict[str, str]]) -> List[str]:
-    """Uses fuzzy matching to find the clippings for the specified ebook."""
-    clipping_titles = list(set(c['title'] for c in all_clippings))
+def find_book_highlights_and_notes(ebook_title: str, all_highlights: List[Dict[str, str]], all_notes: List[Dict[str, str]]) -> Tuple[List[str], List[Dict[str, str]]]:
+    """Uses fuzzy matching to find highlights and notes for the specified ebook."""
+    highlight_titles = list(set(h['title'] for h in all_highlights))
+    note_titles = list(set(n['title'] for n in all_notes))
     
-    logger.debug(f"Searching among {len(clipping_titles)} unique book titles")
+    all_titles = list(set(highlight_titles + note_titles))
+    
+    logger.debug(f"Searching among {len(all_titles)} unique book titles")
     logger.debug(f"Ebook title to match: '{ebook_title}'")
     
-    result = fuzzy_process.extractOne(ebook_title, clipping_titles)
+    result = fuzzy_process.extractOne(ebook_title, all_titles)
     if result is None:
         logger.warning("Could not match ebook to any clippings titles.")
-        return []
+        return [], []
     
     best_match, score = result
     
@@ -883,11 +922,15 @@ def find_book_highlights(ebook_title: str, all_clippings: List[Dict[str, str]]) 
     
     if score < 75:
         logger.warning("Low confidence in title match.")
-        logger.warning("The highlights may be from a different edition or book.")
+        logger.warning("The highlights/notes may be from a different edition or book.")
 
-    highlights = [c['text'] for c in all_clippings if c['title'] == best_match]
-    logger.debug(f"Found {len(highlights)} highlights for this book")
+    # Get highlights
+    highlights = [h['text'] for h in all_highlights if h['title'] == best_match]
     
+    # Get notes with location info preserved
+    book_notes = [n for n in all_notes if n['title'] == best_match]
+    
+    # Remove duplicates from highlights
     seen = set()
     unique_highlights = []
     for h in highlights:
@@ -898,8 +941,8 @@ def find_book_highlights(ebook_title: str, all_clippings: List[Dict[str, str]]) 
     if len(highlights) != len(unique_highlights):
         logger.debug(f"Removed {len(highlights) - len(unique_highlights)} duplicate highlights")
     
-    logger.debug(f"Returning {len(unique_highlights)} unique highlights")
-    return unique_highlights
+    logger.debug(f"Returning {len(unique_highlights)} unique highlights and {len(book_notes)} notes")
+    return unique_highlights, book_notes
 
 # --- TEXT EXTRACTION WITH PROPER PARAGRAPH STRUCTURE ---
 
@@ -954,7 +997,9 @@ def extract_paragraphs_from_html(soup: BeautifulSoup) -> List[Paragraph]:
             """Recursively process element and its children."""
             if isinstance(elem, NavigableString):
                 text = str(elem)
-                if text.strip():  # Only add non-empty text
+                # FIXED: Add text even if it's just whitespace (important for spacing!)
+                # Only skip if it's completely empty (length 0)
+                if len(text) > 0:
                     para.add_text(text, bold=bold, italic=italic, underline=underline, link=link)
             elif isinstance(elem, Tag):
                 # Check if this tag adds formatting
@@ -971,7 +1016,7 @@ def extract_paragraphs_from_html(soup: BeautifulSoup) -> List[Paragraph]:
         for child in block_elem.children:
             process_element(child)
         
-        # Only add paragraph if it has text
+        # Only add paragraph if it has non-whitespace text
         if para.text.strip():
             paragraphs.append(para)
             if processed_count <= 5:
@@ -988,12 +1033,15 @@ def extract_paragraphs_from_html(soup: BeautifulSoup) -> List[Paragraph]:
 def create_highlighted_docx(
     html_path: str,
     highlights: List[str],
+    notes: List[Dict[str, str]],
     doc_title: str,
     matcher_func: Callable,
     threshold: float
 ) -> Tuple[Document, int]:
-    """Create a docx file with highlights and preserved formatting."""
+    """Create a docx file with highlights and user notes."""
     logger.info(f"🔍 Searching for {len(highlights)} highlights using '{matcher_func.__name__}' method...")
+    if notes:
+        logger.info(f"📝 Will add {len(notes)} user notes as comments")
     logger.debug(f"HTML path: {html_path}")
     logger.debug(f"Threshold: {threshold}")
     
@@ -1015,7 +1063,7 @@ def create_highlighted_docx(
     # Build full text for matching
     logger.debug("Building full text for highlight matching...")
     full_text_parts = []
-    para_boundaries = [0]  # Start positions of each paragraph
+    para_boundaries = [0]
     
     for para in paragraphs:
         full_text_parts.append(para.text)
@@ -1032,12 +1080,12 @@ def create_highlighted_docx(
     percentage = (highlights_found/len(highlights)*100) if len(highlights) > 0 else 0
     logger.info(f"📊 Found {highlights_found} of {len(highlights)} highlights ({percentage:.1f}%)")
     
-    if highlights_found == 0:
+    if highlights_found == 0 and len(highlights) > 0:
         logger.warning("⚠️  No highlights were found! This could mean:")
         logger.warning("  - The book text was reformatted during conversion")
         logger.warning("  - The highlights are from a different edition")
         logger.warning("  - Try using the 'vector' method: -m vector")
-    elif percentage < 50:
+    elif percentage < 50 and len(highlights) > 0:
         logger.warning(f"⚠️  Low match rate ({percentage:.1f}%). Consider using -m vector for better results.")
     
     logger.debug(f"Sorting {len(found_spans)} found spans...")
@@ -1048,6 +1096,20 @@ def create_highlighted_docx(
     for start, end in found_spans:
         highlighted_chars.update(range(start, end))
     
+    # Try to locate notes in the text (for adding as comments)
+    note_positions = []
+    if notes:
+        logger.debug(f"Attempting to locate {len(notes)} notes in text...")
+        for note_idx, note in enumerate(notes):
+            # Try to find note context in text using location info or surrounding text
+            # For now, we'll collect them and add at the end or as a separate section
+            # In the future, we could use location info to place them more precisely
+            note_positions.append({
+                'text': note['text'],
+                'location': note.get('location', {}),
+                'position': None  # Could try to estimate position from location info
+            })
+    
     logger.debug("Creating Word document with proper paragraph structure...")
     doc = Document()
     doc.add_heading(doc_title, level=1)
@@ -1057,8 +1119,8 @@ def create_highlighted_docx(
         """Find which paragraph a character position belongs to."""
         for i in range(len(para_boundaries) - 1):
             if para_boundaries[i] <= pos < para_boundaries[i + 1]:
-                return i, pos - para_boundaries[i]  # para_index, pos_within_para
-        return len(paragraphs) - 1, pos - para_boundaries[-2]  # Last paragraph
+                return i, pos - para_boundaries[i]
+        return len(paragraphs) - 1, pos - para_boundaries[-2]
     
     logger.debug("Adding paragraphs to document with highlights and formatting...")
     
@@ -1071,7 +1133,7 @@ def create_highlighted_docx(
         # Get global position of this paragraph
         para_start_global = para_boundaries[para_idx]
         
-        # Build formatting map for this paragraph (local positions)
+        # Build formatting map for this paragraph
         format_map = {}
         for start, end, fmt_type, fmt_data in para.formatting:
             for pos in range(start, end):
@@ -1099,11 +1161,9 @@ def create_highlighted_docx(
                 text = ''.join(current_run_text)
                 run = docx_para.add_run(text)
                 
-                # Apply highlight
                 if current_run_highlighted:
                     run.font.highlight_color = WD_COLOR_INDEX.YELLOW
                 
-                # Apply formatting
                 for fmt_type, fmt_data in current_run_formats:
                     if fmt_type == 'bold':
                         run.bold = True
@@ -1111,7 +1171,6 @@ def create_highlighted_docx(
                         run.italic = True
                     elif fmt_type == 'underline':
                         run.underline = True
-                    # Note: python-docx doesn't easily support hyperlinks in highlighted text
                 
                 current_run_text = []
             
@@ -1135,6 +1194,35 @@ def create_highlighted_docx(
                 elif fmt_type == 'underline':
                     run.underline = True
     
+    # Add user notes section at the end
+    if notes:
+        logger.debug(f"Adding {len(notes)} user notes to document...")
+        doc.add_page_break()
+        doc.add_heading("User Notes & Annotations", level=1)
+        
+        for note_idx, note in enumerate(notes, 1):
+            note_para = doc.add_paragraph()
+            
+            # Add note number/location info
+            location_str = ""
+            if note.get('location'):
+                loc = note['location']
+                if 'page' in loc:
+                    location_str = f" (Page {loc['page']})"
+                elif 'location_start' in loc:
+                    location_str = f" (Location {loc['location_start']})"
+            
+            # Add note header in bold
+            run = note_para.add_run(f"Note {note_idx}{location_str}: ")
+            run.bold = True
+            
+            # Add note text in italic
+            run = note_para.add_run(note['text'])
+            run.italic = True
+            run.font.color.rgb = None  # Use default color
+        
+        logger.info(f"📝 Added {len(notes)} user notes at end of document")
+    
     logger.debug("✓ Document creation complete")
     return doc, highlights_found
 
@@ -1149,7 +1237,7 @@ def hybrid_matcher(book_text: str, highlights: List[str], threshold: float) -> T
     found_spans = []
     matched_indices = set()
     
-    # Phase 1: Regex matching (fast, exact)
+    # Phase 1: Regex matching (fast, exact) with FLEXIBLE spacing
     logger.info("Phase 1: Regex matching for exact matches...")
     highlights_sorted = sorted(enumerate(highlights), key=lambda x: len(x[1]), reverse=True)
     
@@ -1157,7 +1245,20 @@ def hybrid_matcher(book_text: str, highlights: List[str], threshold: float) -> T
         if idx % 10 == 0 and logger.level <= logging.DEBUG:
             logger.debug(f"Regex phase: {idx+1}/{len(highlights)}")
         
-        pattern = re.escape(text).replace(r'\ ', r'\s+').replace(r'\-', r'[-\u2010-\u2015]')
+        # IMPROVED: Make spaces optional between words to handle spacing issues in conversion
+        # Split on whitespace, escape each word, rejoin with flexible space pattern
+        words = text.split()
+        if len(words) > 1:
+            # For multi-word highlights, allow 0-3 spaces between words
+            escaped_words = [re.escape(word) for word in words]
+            pattern = r'\s{0,3}'.join(escaped_words)
+        else:
+            # Single word - use standard escaping
+            pattern = re.escape(text).replace(r'\ ', r'\s+')
+        
+        # Also handle various hyphen/dash characters
+        pattern = pattern.replace(r'\-', r'[-\u2010-\u2015]')
+        
         try:
             for match in re.finditer(pattern, book_text, re.IGNORECASE | re.UNICODE):
                 start, end = match.span()
@@ -1165,7 +1266,9 @@ def hybrid_matcher(book_text: str, highlights: List[str], threshold: float) -> T
                     found_spans.append((start, end))
                     matched_indices.add(idx)
                     break
-        except (re.error, Exception):
+        except (re.error, Exception) as e:
+            if logger.level <= logging.DEBUG:
+                logger.debug(f"Regex error for highlight {idx}: {e}")
             continue
     
     regex_count = len(matched_indices)
@@ -1179,14 +1282,14 @@ def hybrid_matcher(book_text: str, highlights: List[str], threshold: float) -> T
         return found_spans, regex_count
     
     logger.info(f"Phase 2: Difflib fallback for {len(unmatched)} unmatched highlights...")
-    logger.debug("Preparing normalized text for difflib...")
+    logger.debug("These may be nested/overlapping highlights or have spacing issues...")
     
-    # Normalize book text for difflib
-    normalized_book = re.sub(r'\s+', ' ', book_text).lower()
+    # Try progressively relaxed thresholds - LOWER thresholds for spacing issues
+    thresholds = [0.95, 0.90, 0.85, 0.80, 0.75, 0.70, 0.65, threshold]
+    thresholds = sorted(set(thresholds), reverse=True)
     
-    # Try progressively relaxed thresholds
-    thresholds = [0.95, 0.90, 0.85, 0.80, threshold]
-    thresholds = sorted(set(thresholds), reverse=True)  # Remove duplicates, highest first
+    # Track failures for verbose logging
+    unmatched_details = {}
     
     for current_threshold in thresholds:
         if not unmatched:
@@ -1204,32 +1307,110 @@ def hybrid_matcher(book_text: str, highlights: List[str], threshold: float) -> T
                 continue
             
             try:
-                matcher = SequenceMatcher(None, normalized_book, normalized_highlight)
-                match = matcher.find_longest_match(0, len(normalized_book), 0, len(normalized_highlight))
+                # Use difflib on ORIGINAL text (lowercased)
+                matcher = SequenceMatcher(None, book_text.lower(), normalized_highlight)
+                match = matcher.find_longest_match(0, len(book_text), 0, len(normalized_highlight))
                 
                 if match.size == 0:
+                    unmatched_details[idx] = {
+                        'text': text[:100] + '...' if len(text) > 100 else text,
+                        'reason': 'No match found in text',
+                        'best_score': 0.0
+                    }
                     continue
                 
                 similarity = match.size / len(normalized_highlight)
                 
+                # Store best attempt for logging
+                if idx not in unmatched_details or similarity > unmatched_details[idx].get('best_score', 0):
+                    unmatched_details[idx] = {
+                        'text': text[:100] + '...' if len(text) > 100 else text,
+                        'reason': f'Best similarity: {similarity:.2%} (threshold: {current_threshold:.2%})',
+                        'best_score': similarity,
+                        'match_pos': match.a
+                    }
+                
                 if similarity >= current_threshold:
-                    # Map back to original positions
+                    # Get boundaries
                     start = match.a
-                    # Find actual end in original text
-                    end = min(start + len(text) + 50, len(book_text))  # Add buffer for whitespace differences
+                    end = match.a + match.size
                     
-                    # Adjust boundaries to word boundaries if possible
+                    # Expand to full words
                     while start > 0 and book_text[start-1].isalnum():
                         start -= 1
                     while end < len(book_text) and book_text[end].isalnum():
                         end += 1
                     
-                    if not any(max(start, s) < min(end, e) for s, e in found_spans):
+                    # Try MORE FLEXIBLE regex in expanded region
+                    search_start = max(0, start - 100)
+                    search_end = min(len(book_text), end + 100)
+                    search_region = book_text[search_start:search_end]
+                    
+                    # Build flexible pattern
+                    words = text.split()
+                    if len(words) > 1:
+                        escaped_words = [re.escape(word) for word in words]
+                        pattern = r'\s{0,3}'.join(escaped_words)
+                    else:
+                        pattern = re.escape(text).replace(r'\ ', r'\s+')
+                    pattern = pattern.replace(r'\-', r'[-\u2010-\u2015]')
+                    
+                    found_exact = False
+                    
+                    try:
+                        regex_matches = list(re.finditer(pattern, search_region, re.IGNORECASE | re.UNICODE))
+                        
+                        for regex_match in regex_matches:
+                            exact_start = search_start + regex_match.start()
+                            exact_end = search_start + regex_match.end()
+                            
+                            # For high-confidence matches (≥80%), ALLOW overlaps!
+                            # Lower threshold because spacing issues reduce similarity
+                            if similarity >= 0.80:
+                                found_spans.append((exact_start, exact_end))
+                                matched_indices.add(idx)
+                                newly_matched.append(idx)
+                                found_exact = True
+                                if idx in unmatched_details:
+                                    del unmatched_details[idx]
+                                if logger.level <= logging.DEBUG:
+                                    logger.debug(f"       ✓ Highlight {idx}: Added match at {exact_start}-{exact_end} (allowing overlap, sim={similarity:.2%})")
+                                break
+                            else:
+                                # For lower confidence, still check for overlaps
+                                has_overlap = any(max(exact_start, s) < min(exact_end, e) for s, e in found_spans)
+                                if not has_overlap:
+                                    found_spans.append((exact_start, exact_end))
+                                    matched_indices.add(idx)
+                                    newly_matched.append(idx)
+                                    found_exact = True
+                                    if idx in unmatched_details:
+                                        del unmatched_details[idx]
+                                    if logger.level <= logging.DEBUG:
+                                        logger.debug(f"       ✓ Highlight {idx}: Added match at {exact_start}-{exact_end}")
+                                    break
+                    except re.error as e:
+                        if logger.level <= logging.DEBUG:
+                            logger.debug(f"Regex error: {e}")
+                        pass
+                    
+                    # Fallback to fuzzy boundaries if exact regex failed
+                    if not found_exact and similarity >= 0.80:  # Lower threshold
                         found_spans.append((start, end))
                         matched_indices.add(idx)
                         newly_matched.append(idx)
+                        if idx in unmatched_details:
+                            del unmatched_details[idx]
+                        if logger.level <= logging.DEBUG:
+                            logger.debug(f"       ✓ Highlight {idx}: Using fuzzy boundaries at {start}-{end} (allowing overlap, sim={similarity:.2%})")
+                
             except Exception as e:
                 logger.debug(f"Error matching highlight {idx}: {e}")
+                unmatched_details[idx] = {
+                    'text': text[:100] + '...' if len(text) > 100 else text,
+                    'reason': f'Exception: {str(e)[:50]}',
+                    'best_score': 0.0
+                }
                 continue
         
         # Remove newly matched from unmatched list
@@ -1245,7 +1426,265 @@ def hybrid_matcher(book_text: str, highlights: List[str], threshold: float) -> T
     logger.info(f"📊 Total: {total_count}/{len(highlights)} highlights ({total_count/len(highlights)*100:.1f}%)")
     logger.debug(f"   Regex: {regex_count}, Difflib: {difflib_count}, Unmatched: {len(unmatched)}")
     
+    if difflib_count > 0:
+        logger.info(f"💡 Note: {difflib_count} highlights had spacing/formatting differences from conversion")
+    
+    # VERBOSE LOGGING for failed highlights
+    if unmatched_details and logger.level <= logging.DEBUG:
+        logger.debug("\n" + "="*70)
+        logger.debug(f"❌ UNMATCHED HIGHLIGHTS DETAILS ({len(unmatched_details)} highlights):")
+        logger.debug("="*70)
+        for idx, details in sorted(unmatched_details.items()):
+            logger.debug(f"\nHighlight {idx+1}:")
+            logger.debug(f"  Text: {details['text']}")
+            logger.debug(f"  Reason: {details['reason']}")
+            if 'match_pos' in details:
+                logger.debug(f"  Best match position: {details['match_pos']}")
+                pos = details['match_pos']
+                context_start = max(0, pos - 50)
+                context_end = min(len(book_text), pos + 150)
+                logger.debug(f"  Context: ...{book_text[context_start:context_end]}...")
+    
     return found_spans, total_count
+
+def vector_matcher(book_text: str, highlights: List[str], threshold: float) -> Tuple[List[Tuple[int, int]], int]:
+    """Finds highlights using semantic vector similarity with improved confirmation."""
+    logger.debug("Starting vector matching...")
+    
+    # Set environment variables BEFORE any imports
+    import os
+    os.environ['USE_TF'] = '0'
+    os.environ['USE_TORCH'] = '1'
+    os.environ['TRANSFORMERS_NO_TF'] = '1'
+    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+    
+    # Disable Triton if on Windows/Mac
+    if sys.platform in ['win32', 'darwin']:
+        logger.debug(f"Platform {sys.platform} detected, disabling Triton optimizations")
+        os.environ['TRITON_DISABLE'] = '1'
+    
+    if not check_nlp_libraries():
+        handle_error(
+            "The 'vector' method requires PyTorch, sentence-transformers, and nltk.\n"
+            "Install with: pip install torch sentence-transformers nltk\n"
+            "\n"
+            "If you have TensorFlow installed and getting errors, uninstall it:\n"
+            "  pip uninstall tensorflow tf-keras\n"
+            "\n"
+            "Or use the 'hybrid' method instead (recommended):\n"
+            "  python highlight.py --clippings ... -m hybrid"
+        )
+    
+    try:
+        import nltk
+        from sentence_transformers import SentenceTransformer, util
+        import torch
+    except ImportError as e:
+        handle_error(f"Failed to import required libraries: {e}")
+    except Exception as e:
+        handle_error(f"Error importing NLP libraries: {e}")
+    
+    logger.debug("Checking for NLTK punkt tokenizer...")
+    try:
+        nltk.data.find('tokenizers/punkt')
+        logger.debug("✓ punkt tokenizer found")
+    except LookupError:
+        logger.info("Downloading NLTK 'punkt' tokenizer...")
+        try:
+            nltk.download('punkt', quiet=True)
+            logger.debug("✓ punkt tokenizer downloaded")
+        except Exception as e:
+            logger.error(f"Failed to download punkt tokenizer: {e}")
+            handle_error("Could not download required NLTK data")
+    
+    logger.info(f"Loading sentence transformer model: {NLP_MODEL}")
+    try:
+        model = SentenceTransformer(NLP_MODEL, device='cpu')
+        logger.debug(f"✓ Model loaded on CPU")
+    except Exception as e:
+        logger.error(f"Failed to load model: {e}")
+        logger.debug("Full traceback:", exc_info=True)
+        handle_error(
+            f"Could not load NLP model: {e}\n\n"
+            "This might be due to TensorFlow conflicts. Try:\n"
+            "  pip uninstall tensorflow tf-keras\n"
+            "  pip install --upgrade sentence-transformers"
+        )
+    
+    logger.info("Tokenizing book text and mapping sentence positions...")
+    try:
+        book_sentences_raw = nltk.sent_tokenize(book_text)
+        logger.debug(f"✓ Book split into {len(book_sentences_raw)} sentences")
+
+        # Pre-calculate all sentence positions
+        sentence_positions = []
+        book_sentences = []
+        current_pos = 0
+        for sent in book_sentences_raw:
+            pos = book_text.find(sent, current_pos)
+            if pos != -1:
+                sentence_positions.append((pos, pos + len(sent)))
+                book_sentences.append(sent)
+                current_pos = pos + len(sent)
+            else:
+                logger.debug(f"Could not map sentence: {sent[:60]}...")
+
+        logger.debug(f"✓ Successfully mapped {len(book_sentences)} sentences to character positions.")
+
+    except Exception as e:
+        handle_error(f"Failed during sentence tokenization: {e}")
+
+    logger.info("Encoding book sentences...")
+    book_embeddings = model.encode(
+        book_sentences,
+        convert_to_tensor=True,
+        show_progress_bar=logger.level <= logging.INFO,
+        normalize_embeddings=True,
+        device='cpu'
+    )
+
+    logger.info("Encoding highlights...")
+    highlight_embeddings = model.encode(
+        highlights,
+        convert_to_tensor=True,
+        show_progress_bar=logger.level <= logging.INFO,
+        normalize_embeddings=True,
+        device='cpu'
+    )
+
+    logger.info("Computing similarity scores...")
+    cosine_scores = util.cos_sim(highlight_embeddings, book_embeddings)
+    
+    found_spans = []
+    unmatched_details = {}
+    
+    # Prepare normalized book text for difflib fallback
+    normalized_book = re.sub(r'\s+', ' ', book_text).lower()
+    
+    logger.debug(f"Matching highlights with improved confirmation logic (threshold: {threshold})...")
+    for i, text in enumerate(highlights):
+        if i % 10 == 0 and logger.level <= logging.DEBUG:
+            logger.debug(f"Processing highlight {i+1}/{len(highlights)}")
+            
+        try:
+            # INCREASED CANDIDATES for better coverage
+            top_k = min(20, len(book_sentences))  # Increased from 10 to 20
+            top_scores, top_indices = torch.topk(cosine_scores[i], k=top_k)
+            
+            best_score = top_scores[0].item()
+            if logger.level <= logging.DEBUG and (i < 5 or i % 50 == 0):
+                logger.debug(f"Highlight {i+1}: best candidate score = {best_score:.3f}")
+
+            match_found = False
+            best_attempt = None
+            
+            # Loop through ALL top candidates
+            for rank, (score_tensor, idx_tensor) in enumerate(zip(top_scores, top_indices)):
+                if match_found:
+                    break
+                
+                sent_idx = idx_tensor.item()
+                sent_score = score_tensor.item()
+                
+                # Check confidence threshold
+                if sent_score < threshold:
+                    break
+                
+                sent_start, sent_end = sentence_positions[sent_idx]
+                
+                # MUCH LARGER BUFFER for better text capture
+                buffer = max(len(text) * 2, 500)  # At least 500 chars or 2x highlight length
+                context_start = max(0, sent_start - buffer)
+                context_end = min(len(book_text), sent_end + buffer)
+                search_span = book_text[context_start:context_end]
+                
+                if not best_attempt:
+                    best_attempt = {
+                        'score': sent_score,
+                        'region': (context_start, context_end),
+                        'sentence_text': book_sentences[sent_idx][:100]
+                    }
+                
+                # Method 1: Try regex confirmation
+                pattern = re.escape(text).replace(r'\ ', r'\s+').replace(r'\-', r'[-\u2010-\u2015]')
+                try:
+                    for match in re.finditer(pattern, search_span, re.IGNORECASE | re.UNICODE):
+                        final_start = context_start + match.start()
+                        final_end = context_start + match.end()
+                        if not any(max(final_start, s) < min(final_end, e) for s, e in found_spans):
+                            found_spans.append((final_start, final_end))
+                            match_found = True
+                            if i < 5 or (i % 50 == 0 and logger.level <= logging.DEBUG):
+                                logger.debug(f"✓ Confirmed via regex in vector region at {final_start}-{final_end}")
+                            break
+                except re.error:
+                    pass
+                
+                # Method 2: If regex failed, try difflib within the semantic region
+                if not match_found and rank < 5:  # Only try difflib for top 5 candidates
+                    normalized_highlight = re.sub(r'\s+', ' ', text).lower().strip()
+                    normalized_region = re.sub(r'\s+', ' ', search_span).lower()
+                    
+                    matcher = SequenceMatcher(None, normalized_region, normalized_highlight)
+                    match = matcher.find_longest_match(0, len(normalized_region), 0, len(normalized_highlight))
+                    
+                    if match.size > 0:
+                        similarity = match.size / len(normalized_highlight)
+                        
+                        # Use lower threshold for vector-guided difflib (since we already have semantic match)
+                        if similarity >= 0.75:  # More lenient than standalone difflib
+                            # Map back to original text
+                            final_start = context_start + match.a
+                            final_end = min(final_start + len(text) + 50, len(book_text))
+                            
+                            # Adjust to word boundaries
+                            while final_start > 0 and book_text[final_start-1].isalnum():
+                                final_start -= 1
+                            while final_end < len(book_text) and book_text[final_end].isalnum():
+                                final_end += 1
+                            
+                            if not any(max(final_start, s) < min(final_end, e) for s, e in found_spans):
+                                found_spans.append((final_start, final_end))
+                                match_found = True
+                                if i < 5 or (i % 50 == 0 and logger.level <= logging.DEBUG):
+                                    logger.debug(f"✓ Confirmed via difflib (sim={similarity:.2%}) in vector region at {final_start}-{final_end}")
+                                break
+
+            if not match_found:
+                unmatched_details[i] = {
+                    'text': text[:100] + '...' if len(text) > 100 else text,
+                    'best_score': best_score,
+                    'best_sentence': best_attempt['sentence_text'] if best_attempt else 'N/A',
+                    'reason': f"Semantic match found (score={best_score:.3f}) but text confirmation failed"
+                }
+                if logger.level <= logging.DEBUG and i < 10:
+                    logger.debug(f"  ✗ Could not confirm highlight {i+1} despite semantic score {best_score:.3f}")
+
+        except Exception as e:
+            logger.debug(f"Error processing highlight {i}: {e}")
+            unmatched_details[i] = {
+                'text': text[:100] + '...' if len(text) > 100 else text,
+                'best_score': 0.0,
+                'reason': f'Exception: {str(e)[:50]}'
+            }
+            continue
+    
+    # VERBOSE LOGGING for failed highlights
+    if unmatched_details and logger.level <= logging.DEBUG:
+        logger.debug("\n" + "="*70)
+        logger.debug(f"❌ VECTOR UNMATCHED HIGHLIGHTS ({len(unmatched_details)} highlights):")
+        logger.debug("="*70)
+        for idx, details in sorted(list(unmatched_details.items())[:20]):  # Show first 20
+            logger.debug(f"\nHighlight {idx+1}:")
+            logger.debug(f"  Text: {details['text']}")
+            logger.debug(f"  Semantic score: {details['best_score']:.3f}")
+            logger.debug(f"  Best sentence: {details.get('best_sentence', 'N/A')}")
+            logger.debug(f"  Reason: {details['reason']}")
+        if len(unmatched_details) > 20:
+            logger.debug(f"\n... and {len(unmatched_details) - 20} more unmatched highlights")
+            
+    logger.debug(f"✓ Vector matching complete. Found {len(found_spans)} matches")
+    return found_spans, len(found_spans)
 
 def regex_matcher(book_text: str, highlights: List[str]) -> Tuple[List[Tuple[int, int]], int]:
     """Finds highlights using flexible regular expressions."""
@@ -1343,306 +1782,12 @@ def difflib_matcher(book_text: str, highlights: List[str], threshold: float) -> 
     logger.debug(f"✓ Difflib matching complete. Found {matched_count} matches")
     return found_spans, matched_count
 
-def vector_matcher(book_text: str, highlights: List[str], threshold: float) -> Tuple[List[Tuple[int, int]], int]:
-    """Finds highlights using semantic vector similarity with improved text extraction."""
-    logger.debug("Starting vector matching...")
-    
-    # Set environment variables BEFORE any imports
-    import os
-    os.environ['USE_TF'] = '0'
-    os.environ['USE_TORCH'] = '1'
-    os.environ['TRANSFORMERS_NO_TF'] = '1'
-    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-    
-    # Disable Triton if on Windows/Mac
-    if sys.platform in ['win32', 'darwin']:
-        logger.debug(f"Platform {sys.platform} detected, disabling Triton optimizations")
-        os.environ['TRITON_DISABLE'] = '1'
-    
-    if not check_nlp_libraries():
-        handle_error(
-            "The 'vector' method requires PyTorch, sentence-transformers, and nltk.\n"
-            "Install with: pip install torch sentence-transformers nltk\n"
-            "\n"
-            "If you have TensorFlow installed and getting errors, uninstall it:\n"
-            "  pip uninstall tensorflow tf-keras\n"
-            "\n"
-            "Or use the 'hybrid' method instead (recommended):\n"
-            "  python highlight.py --clippings ... -m hybrid"
-        )
-    
-    try:
-        import nltk
-        from sentence_transformers import SentenceTransformer, util
-        import torch
-    except ImportError as e:
-        handle_error(f"Failed to import required libraries: {e}")
-    except Exception as e:
-        handle_error(f"Error importing NLP libraries: {e}")
-    
-    logger.debug("Checking for NLTK punkt tokenizer...")
-    try:
-        nltk.data.find('tokenizers/punkt')
-        logger.debug("✓ punkt tokenizer found")
-    except LookupError:
-        logger.info("Downloading NLTK 'punkt' tokenizer...")
-        try:
-            nltk.download('punkt', quiet=True)
-            logger.debug("✓ punkt tokenizer downloaded")
-        except Exception as e:
-            logger.error(f"Failed to download punkt tokenizer: {e}")
-            handle_error("Could not download required NLTK data")
-    
-    logger.info(f"Loading sentence transformer model: {NLP_MODEL}")
-    try:
-        model = SentenceTransformer(NLP_MODEL, device='cpu')
-        logger.debug(f"✓ Model loaded on CPU")
-    except Exception as e:
-        logger.error(f"Failed to load model: {e}")
-        logger.debug("Full traceback:", exc_info=True)
-        handle_error(
-            f"Could not load NLP model: {e}\n\n"
-            "This might be due to TensorFlow conflicts. Try:\n"
-            "  pip uninstall tensorflow tf-keras\n"
-            "  pip install --upgrade sentence-transformers"
-        )
-    
-    logger.info("Tokenizing book text into sentences...")
-    try:
-        book_sentences = nltk.sent_tokenize(book_text)
-        logger.debug(f"✓ Book split into {len(book_sentences)} sentences")
-    except Exception as e:
-        logger.error(f"Failed to tokenize text: {e}")
-        logger.debug("Full traceback:", exc_info=True)
-        handle_error(f"Could not tokenize book text: {e}")
-    
-    # Build sentence position map for faster lookup
-    sentence_positions = []
-    current_pos = 0
-    for sent in book_sentences:
-        start = book_text.find(sent, current_pos)
-        if start == -1:
-            # Sentence might have whitespace differences
-            normalized_sent = re.sub(r'\s+', ' ', sent.strip())
-            for offset in range(max(0, current_pos - 100), min(len(book_text), current_pos + 500)):
-                test_span = book_text[offset:offset + len(sent) + 100]
-                normalized_test = re.sub(r'\s+', ' ', test_span.strip())
-                if normalized_sent in normalized_test:
-                    start = offset
-                    break
-        
-        if start != -1:
-            end = start + len(sent)
-            sentence_positions.append((start, end))
-            current_pos = end
-        else:
-            sentence_positions.append((current_pos, current_pos))
-    
-    # Handle large books by chunking
-    MAX_SENTENCES = 10000
-    if len(book_sentences) > MAX_SENTENCES:
-        logger.warning(f"Large book ({len(book_sentences)} sentences). Using first {MAX_SENTENCES} sentences...")
-        logger.warning(f"Some highlights might be missed if they're in later chapters.")
-        book_sentences = book_sentences[:MAX_SENTENCES]
-        sentence_positions = sentence_positions[:MAX_SENTENCES]
-    
-    logger.info("Encoding book sentences...")
-    try:
-        logger.debug(f"Encoding {len(book_sentences)} sentences in batches")
-        book_embeddings = model.encode(
-            book_sentences,
-            convert_to_tensor=True,
-            show_progress_bar=logger.level <= logging.INFO,
-            normalize_embeddings=True,
-            batch_size=32,
-            device='cpu'
-        )
-        logger.debug(f"✓ Book embeddings shape: {book_embeddings.shape}")
-    except Exception as e:
-        logger.error(f"Failed to encode book sentences: {e}")
-        logger.debug("Full traceback:", exc_info=True)
-        handle_error(f"Could not encode book text: {e}")
-    
-    logger.info("Encoding highlights...")
-    try:
-        logger.debug(f"Encoding {len(highlights)} highlights")
-        highlight_embeddings = model.encode(
-            highlights,
-            convert_to_tensor=True,
-            show_progress_bar=logger.level <= logging.INFO,
-            normalize_embeddings=True,
-            batch_size=32,
-            device='cpu'
-        )
-        logger.debug(f"✓ Highlight embeddings shape: {highlight_embeddings.shape}")
-    except Exception as e:
-        logger.error(f"Failed to encode highlights: {e}")
-        logger.debug("Full traceback:", exc_info=True)
-        handle_error(f"Could not encode highlights: {e}")
-
-    logger.info("Computing similarity scores...")
-    try:
-        logger.debug("Running cosine similarity...")
-        cosine_scores = util.cos_sim(highlight_embeddings, book_embeddings)
-        logger.debug(f"✓ Cosine scores shape: {cosine_scores.shape}")
-    except Exception as e:
-        logger.error(f"Failed to compute similarity: {e}")
-        logger.debug("Full traceback:", exc_info=True)
-        handle_error(f"Could not compute similarity scores: {e}")
-    
-    found_spans = []
-    
-    logger.debug(f"Matching highlights with threshold {threshold}...")
-    for i, text in enumerate(highlights):
-        if i % 10 == 0 and logger.level <= logging.DEBUG:
-            logger.debug(f"Processing highlight {i+1}/{len(highlights)}")
-        
-        try:
-            # Get top 5 best matching sentences for better coverage
-            top_k = min(5, len(book_sentences))
-            top_scores, top_indices = torch.topk(cosine_scores[i], k=top_k)
-            
-            best_match_idx = top_indices[0].item()
-            confidence = top_scores[0].item()
-            
-            if i < 5 or (i % 100 == 0 and logger.level <= logging.DEBUG):
-                logger.debug(f"Highlight {i+1}: best match sentence {best_match_idx}, confidence = {confidence:.3f}")
-            
-            if confidence <= threshold:
-                if i < 5:
-                    logger.debug(f"Highlight {i+1}: confidence too low ({confidence:.3f} <= {threshold})")
-                continue
-            
-            # Try each of the top matches until we find the text
-            match_found = False
-            for rank, (score_tensor, idx_tensor) in enumerate(zip(top_scores, top_indices)):
-                if match_found:
-                    break
-                
-                sent_idx = idx_tensor.item()
-                sent_score = score_tensor.item()
-                
-                if sent_score < threshold:
-                    break
-                
-                if sent_idx >= len(sentence_positions):
-                    continue
-                
-                sent_start, sent_end = sentence_positions[sent_idx]
-                
-                # Expand search region generously (include surrounding sentences)
-                context_start = sent_start
-                context_end = sent_end
-                
-                # Include 2 sentences before and 3 sentences after
-                for offset in range(max(0, sent_idx - 2), sent_idx):
-                    if offset < len(sentence_positions):
-                        context_start = min(context_start, sentence_positions[offset][0])
-                
-                for offset in range(sent_idx + 1, min(sent_idx + 4, len(sentence_positions))):
-                    if offset < len(sentence_positions):
-                        context_end = max(context_end, sentence_positions[offset][1])
-                
-                # Extend even further for long highlights
-                extra_chars = max(len(text), 200)
-                context_start = max(0, context_start - extra_chars)
-                context_end = min(len(book_text), context_end + extra_chars)
-                
-                search_span = book_text[context_start:context_end]
-                
-                if i < 3:
-                    logger.debug(f"  Trying match {rank+1}: sent {sent_idx}, score {sent_score:.3f}, region [{context_start}:{context_end}] len={len(search_span)}")
-                
-                # Strategy 1: Try exact regex match in region (fastest)
-                pattern = re.escape(text).replace(r'\ ', r'\s+').replace(r'\-', r'[-\u2010-\u2015]')
-                try:
-                    for match in re.finditer(pattern, search_span, re.IGNORECASE | re.UNICODE):
-                        final_start = context_start + match.start()
-                        final_end = context_start + match.end()
-                        
-                        if not any(max(final_start, s) < min(final_end, e) for s, e in found_spans):
-                            found_spans.append((final_start, final_end))
-                            match_found = True
-                            if i < 5:
-                                logger.debug(f"✓ Regex match in vector region at {final_start}-{final_end}")
-                            break
-                except:
-                    pass
-                
-                if match_found:
-                    break
-                
-                # Strategy 2: Try fuzzy matching with progressively lower thresholds
-                normalized_span = re.sub(r'\s+', ' ', search_span).lower()
-                normalized_highlight = re.sub(r'\s+', ' ', text).lower().strip()
-                
-                for fuzz_threshold in [0.95, 0.90, 0.85, 0.80, 0.70]:
-                    if match_found:
-                        break
-                    
-                    try:
-                        matcher = SequenceMatcher(None, normalized_span, normalized_highlight, autojunk=False)
-                        match = matcher.find_longest_match(0, len(normalized_span), 0, len(normalized_highlight))
-                        
-                        if match.size == 0:
-                            continue
-                        
-                        similarity = match.size / len(normalized_highlight)
-                        
-                        if similarity >= fuzz_threshold:
-                            # Map back to original text positions
-                            final_start = context_start + match.a
-                            final_end = final_start + match.size
-                            
-                            # Extend to word boundaries
-                            while final_start > 0 and book_text[final_start-1].isalnum():
-                                final_start -= 1
-                            while final_end < len(book_text) and final_end < context_end and book_text[final_end].isalnum():
-                                final_end += 1
-                            
-                            if not any(max(final_start, s) < min(final_end, e) for s, e in found_spans):
-                                found_spans.append((final_start, final_end))
-                                match_found = True
-                                if i < 5:
-                                    logger.debug(f"✓ Fuzzy match ({similarity:.2f}) in vector region at {final_start}-{final_end}")
-                                break
-                    except:
-                        continue
-                
-                if match_found:
-                    break
-                
-                # Strategy 3: Try substring matching for very short highlights
-                if len(text) < 50 and not match_found:
-                    text_lower = text.lower()
-                    span_lower = search_span.lower()
-                    
-                    if text_lower in span_lower:
-                        pos = span_lower.find(text_lower)
-                        final_start = context_start + pos
-                        final_end = final_start + len(text)
-                        
-                        if not any(max(final_start, s) < min(final_end, e) for s, e in found_spans):
-                            found_spans.append((final_start, final_end))
-                            match_found = True
-                            if i < 5:
-                                logger.debug(f"✓ Substring match in vector region at {final_start}-{final_end}")
-            
-            if not match_found and i < 10:
-                logger.debug(f"  ✗ Could not extract text for highlight {i+1} despite good semantic match")
-                
-        except Exception as e:
-            logger.debug(f"Error processing highlight {i}: {e}")
-            continue
-    
-    logger.debug(f"✓ Vector matching complete. Found {len(found_spans)} matches")
-    return found_spans, len(found_spans)
-
 # --- SINGLE BOOK PROCESSING ---
 
 def process_single_book(
     ebook_path: str,
-    all_clippings: List[Dict[str, str]],
+    all_highlights: List[Dict[str, str]],
+    all_notes: List[Dict[str, str]],
     converter_path: str,
     output_format: str,
     method: str = 'diff',
@@ -1663,6 +1808,7 @@ def process_single_book(
         'output_path': None,
         'highlights_found': 0,
         'highlights_total': 0,
+        'notes_count': 0,
         'error': None
     }
     
@@ -1689,17 +1835,18 @@ def process_single_book(
         
         logger.debug(f"Document title: '{doc_title}'")
         
-        # Find highlights
-        logger.debug("Finding highlights for this book...")
-        relevant_highlights = find_book_highlights(doc_title, all_clippings)
+        # Find highlights and notes
+        logger.debug("Finding highlights and notes for this book...")
+        relevant_highlights, relevant_notes = find_book_highlights_and_notes(doc_title, all_highlights, all_notes)
         
-        if not relevant_highlights:
-            result['error'] = "No highlights found"
-            logger.warning("No highlights found for this book")
+        if not relevant_highlights and not relevant_notes:
+            result['error'] = "No highlights or notes found"
+            logger.warning("No highlights or notes found for this book")
             return result
         
         result['highlights_total'] = len(relevant_highlights)
-        logger.debug(f"Found {len(relevant_highlights)} highlights to match")
+        result['notes_count'] = len(relevant_notes)
+        logger.debug(f"Found {len(relevant_highlights)} highlights and {len(relevant_notes)} notes to process")
         
         # --- COMPARE MODE ---
         if compare_mode:
@@ -1714,7 +1861,7 @@ def process_single_book(
             try:
                 logger.info(f"\n🧪 Testing Regex method...")
                 _, count = create_highlighted_docx(
-                    html_file, relevant_highlights, doc_title,
+                    html_file, relevant_highlights, relevant_notes, doc_title,
                     lambda txt, h, t: regex_matcher(txt, h),
                     threshold=0.0
                 )
@@ -1729,7 +1876,7 @@ def process_single_book(
             try:
                 logger.info(f"\n🧪 Testing Difflib method...")
                 _, count = create_highlighted_docx(
-                    html_file, relevant_highlights, doc_title,
+                    html_file, relevant_highlights, relevant_notes, doc_title,
                     difflib_matcher,
                     similarity_threshold
                 )
@@ -1744,7 +1891,7 @@ def process_single_book(
             try:
                 logger.info(f"\n🧪 Testing Vector method...")
                 _, count = create_highlighted_docx(
-                    html_file, relevant_highlights, doc_title,
+                    html_file, relevant_highlights, relevant_notes, doc_title,
                     vector_matcher,
                     vector_threshold
                 )
@@ -1791,6 +1938,7 @@ def process_single_book(
         doc, found_count = create_highlighted_docx(
             html_file,
             relevant_highlights,
+            relevant_notes,
             doc_title,
             selected_matcher,
             threshold
@@ -2028,7 +2176,7 @@ Note: Library batch mode is enabled by default. Use --no-batch to process only
         logger.debug(f"Clippings path: {clippings_path}")
         
         # Parse clippings
-        all_clippings = parse_clippings(clippings_path)
+        all_highlights, all_notes = parse_clippings(clippings_path)
         
         # Get converter
         converter_path, output_format = check_converter_available(args.calibre_path)
@@ -2045,10 +2193,9 @@ Note: Library batch mode is enabled by default. Use --no-batch to process only
             logger.debug("Library mode: processing books from Calibre library")
             library_path = find_calibre_library(args.library_path)
             books = discover_books(library_path)
-            clipping_titles = [c['title'] for c in all_clippings]
             
-            # Match all books
-            matches = match_books_to_clippings(books, clipping_titles, MIN_TITLE_MATCH_SCORE)
+            # Match all books - UPDATED
+            matches = match_books_to_clippings(books, all_highlights, all_notes, MIN_TITLE_MATCH_SCORE)
             
             if not matches:
                 handle_error("No matching books found in library!")
@@ -2087,26 +2234,25 @@ Note: Library batch mode is enabled by default. Use --no-batch to process only
                     logger.error(f"Best match was {matches[0]['score']}%: '{matches[0]['book']['title']}'")
                     sys.exit(1)
             
-            # Process books
             results = []
-            
             for idx, match in enumerate(books_to_process, 1):
                 book = match['book']
                 logger.info(f"\n{'='*70}")
                 logger.info(f"Processing {idx}/{len(books_to_process)}: {book['title']}")
-                logger.info(f"Match: {match['clipping_title']} ({match['score']}%, {match['highlight_count']} highlights)")
+                logger.info(f"Match: {match['clipping_title']} ({match['score']}%, {match['highlight_count']} items)")
                 logger.info(f"{'='*70}")
                 
                 result = process_single_book(
                     book['path'],
-                    all_clippings,
+                    all_highlights,  # UPDATED
+                    all_notes,       # UPDATED
                     converter_path,
                     output_format,
                     method=args.method,
                     keep_html=args.keep_html,
                     similarity_threshold=args.similarity_threshold,
                     vector_threshold=args.vector_threshold,
-                    compare_mode=False  # No compare in batch mode
+                    compare_mode=False
                 )
                 
                 results.append({
@@ -2115,7 +2261,7 @@ Note: Library batch mode is enabled by default. Use --no-batch to process only
                     **result
                 })
             
-            # Summary
+            # Summary - UPDATED to show notes
             print("\n" + "=" * 70)
             print("📊 BATCH PROCESSING SUMMARY")
             print("=" * 70)
@@ -2134,6 +2280,8 @@ Note: Library batch mode is enabled by default. Use --no-batch to process only
                     pct = (r['highlights_found']/r['highlights_total']*100) if r['highlights_total'] > 0 else 0
                     print(f"   • {r['book_title']}")
                     print(f"     Found {r['highlights_found']}/{r['highlights_total']} highlights ({pct:.1f}%)")
+                    if r.get('notes_count', 0) > 0:
+                        print(f"     Added {r['notes_count']} user notes")
                     print(f"     Saved to: {r['output_path']}")
                 print()
             
@@ -2152,7 +2300,8 @@ Note: Library batch mode is enabled by default. Use --no-batch to process only
             
             result = process_single_book(
                 ebook_path,
-                all_clippings,
+                all_highlights, 
+                all_notes, 
                 converter_path,
                 output_format,
                 method=args.method,
@@ -2164,12 +2313,13 @@ Note: Library batch mode is enabled by default. Use --no-batch to process only
             )
             
             if args.compare:
-                # Results already printed in compare mode
                 logger.debug("Compare mode results displayed")
             elif result['success']:
                 pct = (result['highlights_found']/result['highlights_total']*100) if result['highlights_total'] > 0 else 0
                 print("\n" + "=" * 70)
                 print(f"✅ Success! Found {result['highlights_found']}/{result['highlights_total']} highlights ({pct:.1f}%)")
+                if result.get('notes_count', 0) > 0:
+                    print(f"📝 Added {result['notes_count']} user notes")
                 print(f"📄 Document saved to: {result['output_path']}")
                 print("=" * 70)
             else:
