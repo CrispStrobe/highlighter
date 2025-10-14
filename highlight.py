@@ -1237,34 +1237,78 @@ def hybrid_matcher(book_text: str, highlights: List[str], threshold: float) -> T
     found_spans = []
     matched_indices = set()
     
+    # Detect truncated highlights
+    def is_truncated(text: str) -> bool:
+        """Check if highlight is truncated (ends with ...)"""
+        return text.rstrip().endswith('...')
+    
+    def clean_truncated(text: str) -> str:
+        """Remove trailing ... and whitespace from truncated highlight"""
+        return text.rstrip('.').rstrip()
+    
     # Phase 1: Regex matching (fast, exact) with FLEXIBLE spacing
     logger.info("Phase 1: Regex matching for exact matches...")
     highlights_sorted = sorted(enumerate(highlights), key=lambda x: len(x[1]), reverse=True)
+    
+    truncated_count = sum(1 for _, h in highlights_sorted if is_truncated(h))
+    if truncated_count > 0:
+        logger.info(f"💡 Detected {truncated_count} truncated highlights (will use prefix matching)")
     
     for idx, text in highlights_sorted:
         if idx % 10 == 0 and logger.level <= logging.DEBUG:
             logger.debug(f"Regex phase: {idx+1}/{len(highlights)}")
         
-        # IMPROVED: Make spaces optional between words to handle spacing issues in conversion
-        # Split on whitespace, escape each word, rejoin with flexible space pattern
-        words = text.split()
+        # Handle truncated highlights
+        is_trunc = is_truncated(text)
+        if is_trunc:
+            search_text = clean_truncated(text)
+            if logger.level <= logging.DEBUG and idx < 10:
+                logger.debug(f"  Highlight {idx} is truncated, using: '{search_text}'")
+        else:
+            search_text = text
+        
+        # Build flexible regex pattern
+        words = search_text.split()
         if len(words) > 1:
-            # For multi-word highlights, allow 0-3 spaces between words
             escaped_words = [re.escape(word) for word in words]
             pattern = r'\s{0,3}'.join(escaped_words)
         else:
-            # Single word - use standard escaping
-            pattern = re.escape(text).replace(r'\ ', r'\s+')
+            pattern = re.escape(search_text).replace(r'\ ', r'\s+')
         
-        # Also handle various hyphen/dash characters
         pattern = pattern.replace(r'\-', r'[-\u2010-\u2015]')
+        
+        # For truncated highlights, don't require end-of-match (prefix match)
+        # For full highlights, the pattern naturally matches the full text
         
         try:
             for match in re.finditer(pattern, book_text, re.IGNORECASE | re.UNICODE):
-                start, end = match.span()
+                start = match.start()
+                
+                # For truncated highlights, extend end to include more text
+                if is_trunc:
+                    # Extend to next punctuation or word boundary
+                    end = match.end()
+                    # Look ahead up to 100 chars for a good stopping point
+                    lookahead_end = min(len(book_text), end + 100)
+                    lookahead = book_text[end:lookahead_end]
+                    
+                    # Find next sentence boundary (. ! ?) or paragraph break
+                    for stop_char in ['. ', '! ', '? ', '\n\n']:
+                        pos = lookahead.find(stop_char)
+                        if pos != -1:
+                            end = end + pos + len(stop_char)
+                            break
+                    else:
+                        # No sentence boundary found, just extend by a reasonable amount
+                        end = min(len(book_text), end + 50)
+                else:
+                    end = match.end()
+                
                 if not any(max(start, s) < min(end, e) for s, e in found_spans):
                     found_spans.append((start, end))
                     matched_indices.add(idx)
+                    if is_trunc and logger.level <= logging.DEBUG:
+                        logger.debug(f"  ✓ Matched truncated highlight {idx} at {start}-{end}")
                     break
         except (re.error, Exception) as e:
             if logger.level <= logging.DEBUG:
@@ -1284,11 +1328,10 @@ def hybrid_matcher(book_text: str, highlights: List[str], threshold: float) -> T
     logger.info(f"Phase 2: Difflib fallback for {len(unmatched)} unmatched highlights...")
     logger.debug("These may be nested/overlapping highlights or have spacing issues...")
     
-    # Try progressively relaxed thresholds - LOWER thresholds for spacing issues
-    thresholds = [0.95, 0.90, 0.85, 0.80, 0.75, 0.70, 0.65, threshold]
+    # Try progressively relaxed thresholds - VERY LOW for truncated highlights
+    thresholds = [0.95, 0.90, 0.85, 0.80, 0.75, 0.70, 0.65, 0.60, 0.55, 0.50, threshold]
     thresholds = sorted(set(thresholds), reverse=True)
     
-    # Track failures for verbose logging
     unmatched_details = {}
     
     for current_threshold in thresholds:
@@ -1302,12 +1345,15 @@ def hybrid_matcher(book_text: str, highlights: List[str], threshold: float) -> T
             if idx % 20 == 0 and logger.level <= logging.DEBUG:
                 logger.debug(f"Difflib phase (t={current_threshold:.2f}): {len(newly_matched)} matched so far")
             
-            normalized_highlight = re.sub(r'\s+', ' ', text).lower().strip()
+            # Check if truncated
+            is_trunc = is_truncated(text)
+            search_text = clean_truncated(text) if is_trunc else text
+            
+            normalized_highlight = re.sub(r'\s+', ' ', search_text).lower().strip()
             if not normalized_highlight or len(normalized_highlight) < 3:
                 continue
             
             try:
-                # Use difflib on ORIGINAL text (lowercased)
                 matcher = SequenceMatcher(None, book_text.lower(), normalized_highlight)
                 match = matcher.find_longest_match(0, len(book_text), 0, len(normalized_highlight))
                 
@@ -1315,23 +1361,27 @@ def hybrid_matcher(book_text: str, highlights: List[str], threshold: float) -> T
                     unmatched_details[idx] = {
                         'text': text[:100] + '...' if len(text) > 100 else text,
                         'reason': 'No match found in text',
-                        'best_score': 0.0
+                        'best_score': 0.0,
+                        'truncated': is_trunc
                     }
                     continue
                 
                 similarity = match.size / len(normalized_highlight)
                 
-                # Store best attempt for logging
+                # For truncated highlights, lower the threshold requirement
+                effective_threshold = current_threshold * 0.6 if is_trunc else current_threshold
+                
+                # Store best attempt
                 if idx not in unmatched_details or similarity > unmatched_details[idx].get('best_score', 0):
                     unmatched_details[idx] = {
                         'text': text[:100] + '...' if len(text) > 100 else text,
-                        'reason': f'Best similarity: {similarity:.2%} (threshold: {current_threshold:.2%})',
+                        'reason': f'Best similarity: {similarity:.2%} (threshold: {effective_threshold:.2%}{"*truncated" if is_trunc else ""})',
                         'best_score': similarity,
-                        'match_pos': match.a
+                        'match_pos': match.a,
+                        'truncated': is_trunc
                     }
                 
-                if similarity >= current_threshold:
-                    # Get boundaries
+                if similarity >= effective_threshold:
                     start = match.a
                     end = match.a + match.size
                     
@@ -1341,18 +1391,30 @@ def hybrid_matcher(book_text: str, highlights: List[str], threshold: float) -> T
                     while end < len(book_text) and book_text[end].isalnum():
                         end += 1
                     
-                    # Try MORE FLEXIBLE regex in expanded region
+                    # For truncated, extend further
+                    if is_trunc:
+                        lookahead_end = min(len(book_text), end + 100)
+                        lookahead = book_text[end:lookahead_end]
+                        for stop_char in ['. ', '! ', '? ', '\n\n']:
+                            pos = lookahead.find(stop_char)
+                            if pos != -1:
+                                end = end + pos + len(stop_char)
+                                break
+                        else:
+                            end = min(len(book_text), end + 50)
+                    
+                    # Try flexible regex in region
                     search_start = max(0, start - 100)
                     search_end = min(len(book_text), end + 100)
                     search_region = book_text[search_start:search_end]
                     
                     # Build flexible pattern
-                    words = text.split()
+                    words = search_text.split()
                     if len(words) > 1:
                         escaped_words = [re.escape(word) for word in words]
                         pattern = r'\s{0,3}'.join(escaped_words)
                     else:
-                        pattern = re.escape(text).replace(r'\ ', r'\s+')
+                        pattern = re.escape(search_text).replace(r'\ ', r'\s+')
                     pattern = pattern.replace(r'\-', r'[-\u2010-\u2015]')
                     
                     found_exact = False
@@ -1364,9 +1426,21 @@ def hybrid_matcher(book_text: str, highlights: List[str], threshold: float) -> T
                             exact_start = search_start + regex_match.start()
                             exact_end = search_start + regex_match.end()
                             
-                            # For high-confidence matches (≥80%), ALLOW overlaps!
-                            # Lower threshold because spacing issues reduce similarity
-                            if similarity >= 0.80:
+                            # Extend for truncated
+                            if is_trunc:
+                                lookahead_end = min(len(book_text), exact_end + 100)
+                                lookahead = book_text[exact_end:lookahead_end]
+                                for stop_char in ['. ', '! ', '? ', '\n\n']:
+                                    pos = lookahead.find(stop_char)
+                                    if pos != -1:
+                                        exact_end = exact_end + pos + len(stop_char)
+                                        break
+                                else:
+                                    exact_end = min(len(book_text), exact_end + 50)
+                            
+                            # Allow overlaps for similarity ≥50% (very lenient for truncated)
+                            min_sim_for_overlap = 0.50 if is_trunc else 0.80
+                            if similarity >= min_sim_for_overlap:
                                 found_spans.append((exact_start, exact_end))
                                 matched_indices.add(idx)
                                 newly_matched.append(idx)
@@ -1374,10 +1448,10 @@ def hybrid_matcher(book_text: str, highlights: List[str], threshold: float) -> T
                                 if idx in unmatched_details:
                                     del unmatched_details[idx]
                                 if logger.level <= logging.DEBUG:
-                                    logger.debug(f"       ✓ Highlight {idx}: Added match at {exact_start}-{exact_end} (allowing overlap, sim={similarity:.2%})")
+                                    trunc_note = " (truncated)" if is_trunc else ""
+                                    logger.debug(f"       ✓ Highlight {idx}: Added at {exact_start}-{exact_end}{trunc_note} (sim={similarity:.2%})")
                                 break
                             else:
-                                # For lower confidence, still check for overlaps
                                 has_overlap = any(max(exact_start, s) < min(exact_end, e) for s, e in found_spans)
                                 if not has_overlap:
                                     found_spans.append((exact_start, exact_end))
@@ -1387,39 +1461,41 @@ def hybrid_matcher(book_text: str, highlights: List[str], threshold: float) -> T
                                     if idx in unmatched_details:
                                         del unmatched_details[idx]
                                     if logger.level <= logging.DEBUG:
-                                        logger.debug(f"       ✓ Highlight {idx}: Added match at {exact_start}-{exact_end}")
+                                        logger.debug(f"       ✓ Highlight {idx}: Added at {exact_start}-{exact_end}")
                                     break
-                    except re.error as e:
-                        if logger.level <= logging.DEBUG:
-                            logger.debug(f"Regex error: {e}")
+                    except re.error:
                         pass
                     
-                    # Fallback to fuzzy boundaries if exact regex failed
-                    if not found_exact and similarity >= 0.80:  # Lower threshold
-                        found_spans.append((start, end))
-                        matched_indices.add(idx)
-                        newly_matched.append(idx)
-                        if idx in unmatched_details:
-                            del unmatched_details[idx]
-                        if logger.level <= logging.DEBUG:
-                            logger.debug(f"       ✓ Highlight {idx}: Using fuzzy boundaries at {start}-{end} (allowing overlap, sim={similarity:.2%})")
+                    # Fuzzy fallback
+                    if not found_exact:
+                        min_sim_for_fuzzy = 0.50 if is_trunc else 0.80
+                        if similarity >= min_sim_for_fuzzy:
+                            found_spans.append((start, end))
+                            matched_indices.add(idx)
+                            newly_matched.append(idx)
+                            if idx in unmatched_details:
+                                del unmatched_details[idx]
+                            if logger.level <= logging.DEBUG:
+                                trunc_note = " (truncated)" if is_trunc else ""
+                                logger.debug(f"       ✓ Highlight {idx}: Fuzzy at {start}-{end}{trunc_note} (sim={similarity:.2%})")
                 
             except Exception as e:
                 logger.debug(f"Error matching highlight {idx}: {e}")
                 unmatched_details[idx] = {
                     'text': text[:100] + '...' if len(text) > 100 else text,
                     'reason': f'Exception: {str(e)[:50]}',
-                    'best_score': 0.0
+                    'best_score': 0.0,
+                    'truncated': is_trunc
                 }
                 continue
         
-        # Remove newly matched from unmatched list
         unmatched = [item for item in unmatched if item[0] not in newly_matched]
         
         if newly_matched:
             logger.debug(f"✓ Threshold {current_threshold:.2f}: matched {len(newly_matched)} additional highlights")
     
     difflib_count = len(matched_indices) - regex_count
+    
     total_count = len(matched_indices)
     
     logger.info(f"✓ Difflib fallback found {difflib_count} additional highlights")
@@ -1429,21 +1505,113 @@ def hybrid_matcher(book_text: str, highlights: List[str], threshold: float) -> T
     if difflib_count > 0:
         logger.info(f"💡 Note: {difflib_count} highlights had spacing/formatting differences from conversion")
     
-    # VERBOSE LOGGING for failed highlights
+    # FINAL FALLBACK: For the last few stubborn highlights
+    if unmatched and len(unmatched) <= 3:
+        logger.debug(f"\n🔧 FINAL FALLBACK: Attempting aggressive substring search for last {len(unmatched)} highlight(s)...")
+        
+        for idx, text in unmatched:
+            logger.debug(f"  Processing unmatched highlight {idx}: {text[:80]}...")
+            
+            # Remove ALL whitespace for comparison
+            normalized_highlight = re.sub(r'\s+', '', text.lower())
+            normalized_book = re.sub(r'\s+', '', book_text.lower())
+            
+            # Try first 50 non-space chars
+            search_portion = normalized_highlight[:50]
+            logger.debug(f"    Searching for: '{search_portion}'")
+            
+            pos = normalized_book.find(search_portion)
+            
+            if pos != -1:
+                logger.debug(f"    Found at normalized position: {pos}")
+                
+                # Map back to original position
+                original_pos = 0
+                counted = 0
+                while counted < pos and original_pos < len(book_text):
+                    if not book_text[original_pos].isspace():
+                        counted += 1
+                    original_pos += 1
+                
+                # Find end position
+                original_end = original_pos
+                highlight_chars = min(len(normalized_highlight), 200)  # Limit to 200 chars
+                counted = 0
+                while counted < highlight_chars and original_end < len(book_text):
+                    if not book_text[original_end].isspace():
+                        counted += 1
+                    original_end += 1
+                
+                start = max(0, original_pos - 5)
+                end = min(len(book_text), original_end + 5)
+                
+                # Check for overlap
+                has_overlap = any(max(start, s) < min(end, e) for s, e in found_spans)
+                
+                if not has_overlap or True:  # Always add in final fallback
+                    found_spans.append((start, end))
+                    matched_indices.add(idx)
+                    total_count += 1
+                    logger.debug(f"    ✓ FINAL FALLBACK matched highlight {idx} at {start}-{end}")
+                    
+                    # Remove from unmatched
+                    unmatched = [item for item in unmatched if item[0] != idx]
+                    if idx in unmatched_details:
+                        del unmatched_details[idx]
+            else:
+                logger.debug(f"    ✗ Not found even with substring search")
+    
+    # VERBOSE LOGGING FOR FAILURES (IMPROVED VERSION)
     if unmatched_details and logger.level <= logging.DEBUG:
         logger.debug("\n" + "="*70)
         logger.debug(f"❌ UNMATCHED HIGHLIGHTS DETAILS ({len(unmatched_details)} highlights):")
         logger.debug("="*70)
+        
         for idx, details in sorted(unmatched_details.items()):
-            logger.debug(f"\nHighlight {idx+1}:")
-            logger.debug(f"  Text: {details['text']}")
+            logger.debug(f"\n{'='*70}")
+            logger.debug(f"Highlight {idx+1} (index {idx}):")
+            logger.debug(f"{'='*70}")
+            
+            # Get the FULL text from original highlights list
+            full_text = highlights[idx]
+            logger.debug(f"  Full highlight text ({len(full_text)} chars):")
+            logger.debug(f"    '{full_text}'")
+            logger.debug(f"  Truncated: {details.get('truncated', False)}")
             logger.debug(f"  Reason: {details['reason']}")
+            
             if 'match_pos' in details:
-                logger.debug(f"  Best match position: {details['match_pos']}")
                 pos = details['match_pos']
-                context_start = max(0, pos - 50)
-                context_end = min(len(book_text), pos + 150)
-                logger.debug(f"  Context: ...{book_text[context_start:context_end]}...")
+                logger.debug(f"  Best match position in book: {pos}")
+                
+                # Show generous context from book
+                context_start = max(0, pos - 100)
+                context_end = min(len(book_text), pos + len(full_text) + 100)
+                
+                logger.debug(f"\n  Book text at match position:")
+                logger.debug(f"    {book_text[context_start:context_end]}")
+                
+                # Detailed character comparison
+                highlight_clean = re.sub(r'\s+', ' ', full_text.strip())
+                book_region = book_text[pos:pos + len(full_text) + 50]
+                book_clean = re.sub(r'\s+', ' ', book_region.strip())
+                
+                logger.debug(f"\n  Normalized comparison:")
+                logger.debug(f"    Highlight: {highlight_clean[:200]}")
+                logger.debug(f"    Book:      {book_clean[:200]}")
+                
+                # Find first difference
+                for i, (h_char, b_char) in enumerate(zip(highlight_clean.lower(), book_clean.lower())):
+                    if h_char != b_char:
+                        logger.debug(f"\n  First difference at position {i}:")
+                        logger.debug(f"    Highlight char: '{h_char}' (ord={ord(h_char)})")
+                        logger.debug(f"    Book char:      '{b_char}' (ord={ord(b_char)})")
+                        logger.debug(f"    Context: ...{highlight_clean[max(0,i-20):i+20]}...")
+                        break
+                else:
+                    if len(highlight_clean) != len(book_clean):
+                        logger.debug(f"\n  Length mismatch: highlight={len(highlight_clean)}, book={len(book_clean)}")
+                    else:
+                        logger.debug(f"\n  Strings appear identical when normalized!")
     
     return found_spans, total_count
 
@@ -1672,16 +1840,45 @@ def vector_matcher(book_text: str, highlights: List[str], threshold: float) -> T
     # VERBOSE LOGGING for failed highlights
     if unmatched_details and logger.level <= logging.DEBUG:
         logger.debug("\n" + "="*70)
-        logger.debug(f"❌ VECTOR UNMATCHED HIGHLIGHTS ({len(unmatched_details)} highlights):")
+        logger.debug(f"❌ UNMATCHED HIGHLIGHTS DETAILS ({len(unmatched_details)} highlights):")
         logger.debug("="*70)
-        for idx, details in sorted(list(unmatched_details.items())[:20]):  # Show first 20
+        for idx, details in sorted(unmatched_details.items()):
             logger.debug(f"\nHighlight {idx+1}:")
-            logger.debug(f"  Text: {details['text']}")
-            logger.debug(f"  Semantic score: {details['best_score']:.3f}")
-            logger.debug(f"  Best sentence: {details.get('best_sentence', 'N/A')}")
+            
+            # Get the FULL text, not truncated for display
+            full_text = highlights[idx]
+            logger.debug(f"  Full highlight text ({len(full_text)} chars): {full_text}")
+            logger.debug(f"  Truncated: {details.get('truncated', False)}")
             logger.debug(f"  Reason: {details['reason']}")
-        if len(unmatched_details) > 20:
-            logger.debug(f"\n... and {len(unmatched_details) - 20} more unmatched highlights")
+            
+            if 'match_pos' in details:
+                logger.debug(f"  Best match position: {details['match_pos']}")
+                pos = details['match_pos']
+                
+                # Show exact region where difflib found the best match
+                match_length = len(full_text)
+                context_start = max(0, pos - 50)
+                context_end = min(len(book_text), pos + match_length + 50)
+                
+                logger.debug(f"  Book text at match position ({context_end - context_start} chars):")
+                logger.debug(f"    {book_text[context_start:context_end]}")
+                
+                # Character-by-character comparison
+                highlight_normalized = re.sub(r'\s+', ' ', full_text.lower().strip())
+                book_region = book_text[pos:pos + len(highlight_normalized) + 50].lower()
+                
+                logger.debug(f"\n  Character comparison:")
+                logger.debug(f"    Highlight (normalized): {highlight_normalized}")
+                logger.debug(f"    Book (from match pos):  {book_region[:len(highlight_normalized)]}")
+                
+                # Find differences
+                diffs = []
+                for i, (h_char, b_char) in enumerate(zip(highlight_normalized, book_region)):
+                    if h_char != b_char:
+                        diffs.append(f"pos {i}: '{h_char}' vs '{b_char}'")
+                
+                if diffs:
+                    logger.debug(f"  First 10 differences: {diffs[:10]}")
             
     logger.debug(f"✓ Vector matching complete. Found {len(found_spans)} matches")
     return found_spans, len(found_spans)
