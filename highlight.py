@@ -54,6 +54,11 @@ from bs4 import BeautifulSoup, NavigableString, Tag
 from thefuzz import process as fuzzy_process
 from thefuzz import fuzz
 
+os.environ['USE_TF'] = '0'
+os.environ['USE_TORCH'] = '1'
+os.environ['TRANSFORMERS_NO_TF'] = '1'
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Suppress TensorFlow warnings
+
 # --- CONFIGURATION ---
 DEFAULT_CALIBRE_LIBRARY = os.path.expanduser('~/Calibre Library/')
 DEFAULT_SIMILARITY_THRESHOLD = 0.9
@@ -320,14 +325,58 @@ def check_dependencies(calibre_path: Optional[str] = None) -> Dict[str, bool]:
 def check_nlp_libraries() -> bool:
     """Checks if the required NLP libraries are installed."""
     logger.debug("Checking NLP libraries for vector matching...")
+    
+    # Disable TensorFlow to avoid import conflicts
+    import os
+    os.environ['USE_TF'] = '0'
+    os.environ['USE_TORCH'] = '1'
+    os.environ['TRANSFORMERS_NO_TF'] = '1'
+    
     try:
         import torch
+        logger.debug("✓ torch found")
+    except ImportError as e:
+        logger.debug(f"torch not found: {e}")
+        return False
+    
+    try:
         import nltk
+        logger.debug("✓ nltk found")
+    except ImportError as e:
+        logger.debug(f"nltk not found: {e}")
+        return False
+    
+    try:
+        # Try importing with TF disabled
         from sentence_transformers import SentenceTransformer, util
-        logger.debug("✓ NLP libraries found (torch, nltk, sentence_transformers)")
+        logger.debug("✓ sentence_transformers found")
         return True
     except ImportError as e:
-        logger.debug(f"NLP library missing: {e}")
+        logger.debug(f"sentence_transformers not found: {e}")
+        return False
+    except RuntimeError as e:
+        error_msg = str(e)
+        if 'tensorflow' in error_msg.lower() or 'tf_keras' in error_msg.lower():
+            logger.error("=" * 70)
+            logger.error("TensorFlow compatibility issue detected!")
+            logger.error("=" * 70)
+            logger.error("Your environment has a TensorFlow/transformers version conflict.")
+            logger.error("\nTo fix this, run ONE of these solutions:")
+            logger.error("\n1. Uninstall TensorFlow (sentence_transformers only needs PyTorch):")
+            logger.error("   pip uninstall tensorflow tf-keras")
+            logger.error("\n2. OR create a fresh environment:")
+            logger.error("   conda create -n highlighter python=3.11")
+            logger.error("   conda activate highlighter")
+            logger.error("   pip install sentence-transformers torch nltk")
+            logger.error("\n3. OR use hybrid/regex/diff methods instead (no NLP needed):")
+            logger.error("   python highlight.py --clippings ... -m hybrid")
+            logger.error("=" * 70)
+            return False
+        else:
+            logger.debug(f"Unexpected runtime error: {e}")
+            return False
+    except Exception as e:
+        logger.debug(f"Unexpected error checking NLP libraries: {e}")
         return False
 
 # --- CALIBRE LIBRARY FUNCTIONS ---
@@ -1091,6 +1140,113 @@ def create_highlighted_docx(
 
 # --- MATCHER IMPLEMENTATIONS ---
 
+def hybrid_matcher(book_text: str, highlights: List[str], threshold: float) -> Tuple[List[Tuple[int, int]], int]:
+    """
+    Hybrid matcher: Try regex first, then difflib for unmatched highlights.
+    Uses progressively relaxed thresholds for difflib fallback.
+    """
+    logger.debug("Starting hybrid matching (regex → difflib fallback)...")
+    found_spans = []
+    matched_indices = set()
+    
+    # Phase 1: Regex matching (fast, exact)
+    logger.info("Phase 1: Regex matching for exact matches...")
+    highlights_sorted = sorted(enumerate(highlights), key=lambda x: len(x[1]), reverse=True)
+    
+    for idx, text in highlights_sorted:
+        if idx % 10 == 0 and logger.level <= logging.DEBUG:
+            logger.debug(f"Regex phase: {idx+1}/{len(highlights)}")
+        
+        pattern = re.escape(text).replace(r'\ ', r'\s+').replace(r'\-', r'[-\u2010-\u2015]')
+        try:
+            for match in re.finditer(pattern, book_text, re.IGNORECASE | re.UNICODE):
+                start, end = match.span()
+                if not any(max(start, s) < min(end, e) for s, e in found_spans):
+                    found_spans.append((start, end))
+                    matched_indices.add(idx)
+                    break
+        except (re.error, Exception):
+            continue
+    
+    regex_count = len(matched_indices)
+    logger.info(f"✓ Regex found {regex_count}/{len(highlights)} highlights ({regex_count/len(highlights)*100:.1f}%)")
+    
+    # Phase 2: Difflib fallback for unmatched highlights
+    unmatched = [(idx, text) for idx, text in enumerate(highlights) if idx not in matched_indices]
+    
+    if not unmatched:
+        logger.info("All highlights matched with regex!")
+        return found_spans, regex_count
+    
+    logger.info(f"Phase 2: Difflib fallback for {len(unmatched)} unmatched highlights...")
+    logger.debug("Preparing normalized text for difflib...")
+    
+    # Normalize book text for difflib
+    normalized_book = re.sub(r'\s+', ' ', book_text).lower()
+    
+    # Try progressively relaxed thresholds
+    thresholds = [0.95, 0.90, 0.85, 0.80, threshold]
+    thresholds = sorted(set(thresholds), reverse=True)  # Remove duplicates, highest first
+    
+    for current_threshold in thresholds:
+        if not unmatched:
+            break
+            
+        logger.debug(f"Trying difflib with threshold {current_threshold:.2f} for {len(unmatched)} highlights...")
+        newly_matched = []
+        
+        for idx, text in unmatched:
+            if idx % 20 == 0 and logger.level <= logging.DEBUG:
+                logger.debug(f"Difflib phase (t={current_threshold:.2f}): {len(newly_matched)} matched so far")
+            
+            normalized_highlight = re.sub(r'\s+', ' ', text).lower().strip()
+            if not normalized_highlight or len(normalized_highlight) < 3:
+                continue
+            
+            try:
+                matcher = SequenceMatcher(None, normalized_book, normalized_highlight)
+                match = matcher.find_longest_match(0, len(normalized_book), 0, len(normalized_highlight))
+                
+                if match.size == 0:
+                    continue
+                
+                similarity = match.size / len(normalized_highlight)
+                
+                if similarity >= current_threshold:
+                    # Map back to original positions
+                    start = match.a
+                    # Find actual end in original text
+                    end = min(start + len(text) + 50, len(book_text))  # Add buffer for whitespace differences
+                    
+                    # Adjust boundaries to word boundaries if possible
+                    while start > 0 and book_text[start-1].isalnum():
+                        start -= 1
+                    while end < len(book_text) and book_text[end].isalnum():
+                        end += 1
+                    
+                    if not any(max(start, s) < min(end, e) for s, e in found_spans):
+                        found_spans.append((start, end))
+                        matched_indices.add(idx)
+                        newly_matched.append(idx)
+            except Exception as e:
+                logger.debug(f"Error matching highlight {idx}: {e}")
+                continue
+        
+        # Remove newly matched from unmatched list
+        unmatched = [item for item in unmatched if item[0] not in newly_matched]
+        
+        if newly_matched:
+            logger.debug(f"✓ Threshold {current_threshold:.2f}: matched {len(newly_matched)} additional highlights")
+    
+    difflib_count = len(matched_indices) - regex_count
+    total_count = len(matched_indices)
+    
+    logger.info(f"✓ Difflib fallback found {difflib_count} additional highlights")
+    logger.info(f"📊 Total: {total_count}/{len(highlights)} highlights ({total_count/len(highlights)*100:.1f}%)")
+    logger.debug(f"   Regex: {regex_count}, Difflib: {difflib_count}, Unmatched: {len(unmatched)}")
+    
+    return found_spans, total_count
+
 def regex_matcher(book_text: str, highlights: List[str]) -> Tuple[List[Tuple[int, int]], int]:
     """Finds highlights using flexible regular expressions."""
     logger.debug("Starting regex matching...")
@@ -1126,59 +1282,103 @@ def regex_matcher(book_text: str, highlights: List[str]) -> Tuple[List[Tuple[int
     return found_spans, len(found_spans)
 
 def difflib_matcher(book_text: str, highlights: List[str], threshold: float) -> Tuple[List[Tuple[int, int]], int]:
-    """Finds highlights using difflib's SequenceMatcher."""
+    """Improved difflib matcher with better performance and accuracy."""
     logger.debug(f"Starting difflib matching with threshold {threshold}...")
     found_spans = []
     
     logger.debug("Normalizing book text...")
-    normalized_book_text = re.sub(r'\s+', ' ', book_text).lower()
-    logger.debug(f"Normalized text length: {len(normalized_book_text)}")
+    normalized_book = re.sub(r'\s+', ' ', book_text).lower()
+    logger.debug(f"Normalized text length: {len(normalized_book)}")
     
-    highlights_sorted = sorted(highlights, key=len, reverse=True)
+    highlights_sorted = sorted(enumerate(highlights), key=lambda x: len(x[1]), reverse=True)
     logger.debug(f"Processing {len(highlights_sorted)} highlights")
     
-    for idx, text in enumerate(highlights_sorted):
-        if idx % 10 == 0 and logger.level <= logging.DEBUG:
-            logger.debug(f"Processing highlight {idx+1}/{len(highlights)}")
+    matched_count = 0
+    
+    for list_idx, (orig_idx, text) in enumerate(highlights_sorted):
+        if list_idx % 10 == 0 and logger.level <= logging.DEBUG:
+            logger.debug(f"Processing highlight {list_idx+1}/{len(highlights)}")
         
-        normalized_highlight = re.sub(r'\s+', ' ', text).lower()
-        if not normalized_highlight:
+        normalized_highlight = re.sub(r'\s+', ' ', text).lower().strip()
+        if not normalized_highlight or len(normalized_highlight) < MIN_HIGHLIGHT_LENGTH:
             continue
 
         try:
-            matcher = SequenceMatcher(None, normalized_book_text, normalized_highlight)
-            match = matcher.find_longest_match(0, len(normalized_book_text), 0, len(normalized_highlight))
+            # Use SequenceMatcher for fuzzy matching
+            matcher = SequenceMatcher(None, normalized_book, normalized_highlight, autojunk=False)
+            match = matcher.find_longest_match(0, len(normalized_book), 0, len(normalized_highlight))
             
-            similarity = match.size / len(normalized_highlight) if len(normalized_highlight) > 0 else 0
+            if match.size == 0:
+                continue
             
-            if idx < 5:
-                logger.debug(f"Highlight {idx}: similarity = {similarity:.3f}, match_size = {match.size}")
+            similarity = match.size / len(normalized_highlight)
+            
+            if list_idx < 5:
+                logger.debug(f"Highlight {list_idx}: similarity = {similarity:.3f}, match_size = {match.size}/{len(normalized_highlight)}")
             
             if similarity >= threshold:
+                # Map normalized position back to original text position
+                # Find corresponding position in original text
                 start = match.a
-                end = match.a + len(text)
-                end = min(end, len(book_text))
                 
+                # Calculate end position with buffer for formatting differences
+                end = min(start + int(len(text) * 1.2), len(book_text))
+                
+                # Refine boundaries to avoid cutting words
+                while start > 0 and book_text[start-1:start].strip() == '' and book_text[start-1].isalnum():
+                    start -= 1
+                while end < len(book_text) and book_text[end:end+1].strip() == '' and book_text[end].isalnum():
+                    end += 1
+                
+                # Check for overlap
                 if not any(max(start, s) < min(end, e) for s, e in found_spans):
                     found_spans.append((start, end))
-                    if idx < 5:
+                    matched_count += 1
+                    if list_idx < 5:
                         logger.debug(f"✓ Match found with {similarity:.2%} similarity at position {start}-{end}")
         except Exception as e:
-            logger.debug(f"Error matching highlight {idx}: {e}")
+            logger.debug(f"Error matching highlight {orig_idx}: {e}")
             continue
     
-    logger.debug(f"✓ Difflib matching complete. Found {len(found_spans)} matches")
-    return found_spans, len(found_spans)
+    logger.debug(f"✓ Difflib matching complete. Found {matched_count} matches")
+    return found_spans, matched_count
 
 def vector_matcher(book_text: str, highlights: List[str], threshold: float) -> Tuple[List[Tuple[int, int]], int]:
-    """Finds highlights using semantic vector similarity."""
+    """Finds highlights using semantic vector similarity with improved text extraction."""
     logger.debug("Starting vector matching...")
     
-    if not check_nlp_libraries():
-        handle_error("The 'vector' method requires 'sentence-transformers', 'torch', and 'nltk'.\nPlease install them: pip install sentence-transformers torch nltk")
+    # Set environment variables BEFORE any imports
+    import os
+    os.environ['USE_TF'] = '0'
+    os.environ['USE_TORCH'] = '1'
+    os.environ['TRANSFORMERS_NO_TF'] = '1'
+    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
     
-    import nltk
-    from sentence_transformers import SentenceTransformer, util
+    # Disable Triton if on Windows/Mac
+    if sys.platform in ['win32', 'darwin']:
+        logger.debug(f"Platform {sys.platform} detected, disabling Triton optimizations")
+        os.environ['TRITON_DISABLE'] = '1'
+    
+    if not check_nlp_libraries():
+        handle_error(
+            "The 'vector' method requires PyTorch, sentence-transformers, and nltk.\n"
+            "Install with: pip install torch sentence-transformers nltk\n"
+            "\n"
+            "If you have TensorFlow installed and getting errors, uninstall it:\n"
+            "  pip uninstall tensorflow tf-keras\n"
+            "\n"
+            "Or use the 'hybrid' method instead (recommended):\n"
+            "  python highlight.py --clippings ... -m hybrid"
+        )
+    
+    try:
+        import nltk
+        from sentence_transformers import SentenceTransformer, util
+        import torch
+    except ImportError as e:
+        handle_error(f"Failed to import required libraries: {e}")
+    except Exception as e:
+        handle_error(f"Error importing NLP libraries: {e}")
     
     logger.debug("Checking for NLTK punkt tokenizer...")
     try:
@@ -1195,12 +1395,17 @@ def vector_matcher(book_text: str, highlights: List[str], threshold: float) -> T
     
     logger.info(f"Loading sentence transformer model: {NLP_MODEL}")
     try:
-        model = SentenceTransformer(NLP_MODEL)
-        logger.debug(f"✓ Model loaded: {type(model)}")
+        model = SentenceTransformer(NLP_MODEL, device='cpu')
+        logger.debug(f"✓ Model loaded on CPU")
     except Exception as e:
         logger.error(f"Failed to load model: {e}")
         logger.debug("Full traceback:", exc_info=True)
-        handle_error(f"Could not load NLP model: {e}")
+        handle_error(
+            f"Could not load NLP model: {e}\n\n"
+            "This might be due to TensorFlow conflicts. Try:\n"
+            "  pip uninstall tensorflow tf-keras\n"
+            "  pip install --upgrade sentence-transformers"
+        )
     
     logger.info("Tokenizing book text into sentences...")
     try:
@@ -1211,18 +1416,46 @@ def vector_matcher(book_text: str, highlights: List[str], threshold: float) -> T
         logger.debug("Full traceback:", exc_info=True)
         handle_error(f"Could not tokenize book text: {e}")
     
-    if len(book_sentences) > 10000:
-        logger.warning(f"Large number of sentences ({len(book_sentences)}). This may take several minutes...")
+    # Build sentence position map for faster lookup
+    sentence_positions = []
+    current_pos = 0
+    for sent in book_sentences:
+        start = book_text.find(sent, current_pos)
+        if start == -1:
+            # Sentence might have whitespace differences
+            normalized_sent = re.sub(r'\s+', ' ', sent.strip())
+            for offset in range(max(0, current_pos - 100), min(len(book_text), current_pos + 500)):
+                test_span = book_text[offset:offset + len(sent) + 100]
+                normalized_test = re.sub(r'\s+', ' ', test_span.strip())
+                if normalized_sent in normalized_test:
+                    start = offset
+                    break
+        
+        if start != -1:
+            end = start + len(sent)
+            sentence_positions.append((start, end))
+            current_pos = end
+        else:
+            sentence_positions.append((current_pos, current_pos))
+    
+    # Handle large books by chunking
+    MAX_SENTENCES = 10000
+    if len(book_sentences) > MAX_SENTENCES:
+        logger.warning(f"Large book ({len(book_sentences)} sentences). Using first {MAX_SENTENCES} sentences...")
+        logger.warning(f"Some highlights might be missed if they're in later chapters.")
+        book_sentences = book_sentences[:MAX_SENTENCES]
+        sentence_positions = sentence_positions[:MAX_SENTENCES]
     
     logger.info("Encoding book sentences...")
     try:
-        logger.debug(f"Encoding {len(book_sentences)} sentences with batch_size=32")
+        logger.debug(f"Encoding {len(book_sentences)} sentences in batches")
         book_embeddings = model.encode(
             book_sentences,
             convert_to_tensor=True,
             show_progress_bar=logger.level <= logging.INFO,
             normalize_embeddings=True,
-            batch_size=32
+            batch_size=32,
+            device='cpu'
         )
         logger.debug(f"✓ Book embeddings shape: {book_embeddings.shape}")
     except Exception as e:
@@ -1238,7 +1471,8 @@ def vector_matcher(book_text: str, highlights: List[str], threshold: float) -> T
             convert_to_tensor=True,
             show_progress_bar=logger.level <= logging.INFO,
             normalize_embeddings=True,
-            batch_size=32
+            batch_size=32,
+            device='cpu'
         )
         logger.debug(f"✓ Highlight embeddings shape: {highlight_embeddings.shape}")
     except Exception as e:
@@ -1258,42 +1492,145 @@ def vector_matcher(book_text: str, highlights: List[str], threshold: float) -> T
     
     found_spans = []
     
+    logger.debug(f"Matching highlights with threshold {threshold}...")
     for i, text in enumerate(highlights):
         if i % 10 == 0 and logger.level <= logging.DEBUG:
             logger.debug(f"Processing highlight {i+1}/{len(highlights)}")
         
         try:
-            best_match_idx = cosine_scores[i].argmax().item()
-            confidence = cosine_scores[i][best_match_idx].item()
+            # Get top 5 best matching sentences for better coverage
+            top_k = min(5, len(book_sentences))
+            top_scores, top_indices = torch.topk(cosine_scores[i], k=top_k)
+            
+            best_match_idx = top_indices[0].item()
+            confidence = top_scores[0].item()
             
             if i < 5 or (i % 100 == 0 and logger.level <= logging.DEBUG):
                 logger.debug(f"Highlight {i+1}: best match sentence {best_match_idx}, confidence = {confidence:.3f}")
             
-            if confidence > threshold:
-                sentence = book_sentences[best_match_idx]
-                search_start = book_text.find(sentence)
-                
-                if search_start != -1:
-                    search_end = search_start + len(sentence) + int(len(text) * 0.3)
-                    search_end = min(search_end, len(book_text))
-                    search_span = book_text[search_start:search_end]
-                    
-                    matcher = SequenceMatcher(None, search_span, text, autojunk=False)
-                    match = matcher.find_longest_match(0, len(search_span), 0, len(text))
-                    
-                    final_start = search_start + match.a
-                    final_end = final_start + match.size
-                    
-                    if not any(max(final_start, s) < min(final_end, e) for s, e in found_spans):
-                        found_spans.append((final_start, final_end))
-                        if i < 5:
-                            logger.debug(f"✓ Match added at position {final_start}-{final_end}")
-                else:
-                    if i < 5:
-                        logger.debug(f"Could not find sentence in book text")
-            else:
+            if confidence <= threshold:
                 if i < 5:
-                    logger.debug(f"Highlight {i+1}: confidence too low ({confidence:.3f} < {threshold})")
+                    logger.debug(f"Highlight {i+1}: confidence too low ({confidence:.3f} <= {threshold})")
+                continue
+            
+            # Try each of the top matches until we find the text
+            match_found = False
+            for rank, (score_tensor, idx_tensor) in enumerate(zip(top_scores, top_indices)):
+                if match_found:
+                    break
+                
+                sent_idx = idx_tensor.item()
+                sent_score = score_tensor.item()
+                
+                if sent_score < threshold:
+                    break
+                
+                if sent_idx >= len(sentence_positions):
+                    continue
+                
+                sent_start, sent_end = sentence_positions[sent_idx]
+                
+                # Expand search region generously (include surrounding sentences)
+                context_start = sent_start
+                context_end = sent_end
+                
+                # Include 2 sentences before and 3 sentences after
+                for offset in range(max(0, sent_idx - 2), sent_idx):
+                    if offset < len(sentence_positions):
+                        context_start = min(context_start, sentence_positions[offset][0])
+                
+                for offset in range(sent_idx + 1, min(sent_idx + 4, len(sentence_positions))):
+                    if offset < len(sentence_positions):
+                        context_end = max(context_end, sentence_positions[offset][1])
+                
+                # Extend even further for long highlights
+                extra_chars = max(len(text), 200)
+                context_start = max(0, context_start - extra_chars)
+                context_end = min(len(book_text), context_end + extra_chars)
+                
+                search_span = book_text[context_start:context_end]
+                
+                if i < 3:
+                    logger.debug(f"  Trying match {rank+1}: sent {sent_idx}, score {sent_score:.3f}, region [{context_start}:{context_end}] len={len(search_span)}")
+                
+                # Strategy 1: Try exact regex match in region (fastest)
+                pattern = re.escape(text).replace(r'\ ', r'\s+').replace(r'\-', r'[-\u2010-\u2015]')
+                try:
+                    for match in re.finditer(pattern, search_span, re.IGNORECASE | re.UNICODE):
+                        final_start = context_start + match.start()
+                        final_end = context_start + match.end()
+                        
+                        if not any(max(final_start, s) < min(final_end, e) for s, e in found_spans):
+                            found_spans.append((final_start, final_end))
+                            match_found = True
+                            if i < 5:
+                                logger.debug(f"✓ Regex match in vector region at {final_start}-{final_end}")
+                            break
+                except:
+                    pass
+                
+                if match_found:
+                    break
+                
+                # Strategy 2: Try fuzzy matching with progressively lower thresholds
+                normalized_span = re.sub(r'\s+', ' ', search_span).lower()
+                normalized_highlight = re.sub(r'\s+', ' ', text).lower().strip()
+                
+                for fuzz_threshold in [0.95, 0.90, 0.85, 0.80, 0.70]:
+                    if match_found:
+                        break
+                    
+                    try:
+                        matcher = SequenceMatcher(None, normalized_span, normalized_highlight, autojunk=False)
+                        match = matcher.find_longest_match(0, len(normalized_span), 0, len(normalized_highlight))
+                        
+                        if match.size == 0:
+                            continue
+                        
+                        similarity = match.size / len(normalized_highlight)
+                        
+                        if similarity >= fuzz_threshold:
+                            # Map back to original text positions
+                            final_start = context_start + match.a
+                            final_end = final_start + match.size
+                            
+                            # Extend to word boundaries
+                            while final_start > 0 and book_text[final_start-1].isalnum():
+                                final_start -= 1
+                            while final_end < len(book_text) and final_end < context_end and book_text[final_end].isalnum():
+                                final_end += 1
+                            
+                            if not any(max(final_start, s) < min(final_end, e) for s, e in found_spans):
+                                found_spans.append((final_start, final_end))
+                                match_found = True
+                                if i < 5:
+                                    logger.debug(f"✓ Fuzzy match ({similarity:.2f}) in vector region at {final_start}-{final_end}")
+                                break
+                    except:
+                        continue
+                
+                if match_found:
+                    break
+                
+                # Strategy 3: Try substring matching for very short highlights
+                if len(text) < 50 and not match_found:
+                    text_lower = text.lower()
+                    span_lower = search_span.lower()
+                    
+                    if text_lower in span_lower:
+                        pos = span_lower.find(text_lower)
+                        final_start = context_start + pos
+                        final_end = final_start + len(text)
+                        
+                        if not any(max(final_start, s) < min(final_end, e) for s, e in found_spans):
+                            found_spans.append((final_start, final_end))
+                            match_found = True
+                            if i < 5:
+                                logger.debug(f"✓ Substring match in vector region at {final_start}-{final_end}")
+            
+            if not match_found and i < 10:
+                logger.debug(f"  ✗ Could not extract text for highlight {i+1} despite good semantic match")
+                
         except Exception as e:
             logger.debug(f"Error processing highlight {i}: {e}")
             continue
@@ -1441,6 +1778,10 @@ def process_single_book(
             selected_matcher = difflib_matcher
             threshold = similarity_threshold
             logger.debug(f"Using difflib matcher (threshold: {threshold})")
+        elif method == 'hybrid':
+            selected_matcher = hybrid_matcher
+            threshold = similarity_threshold
+            logger.debug(f"Using hybrid matcher (regex + difflib fallback, threshold: {threshold})")
         else:  # vector
             selected_matcher = vector_matcher
             threshold = vector_threshold
@@ -1587,9 +1928,9 @@ Note: Library batch mode is enabled by default. Use --no-batch to process only
     matching_group = parser.add_argument_group('Matching Options')
     matching_group.add_argument(
         "-m", "--method",
-        choices=['regex', 'diff', 'vector'],
-        default='diff',
-        help="Matching method: regex (fast), diff (balanced, default), vector (best accuracy)"
+        choices=['regex', 'diff', 'hybrid', 'vector'],
+        default='hybrid',  # Changed from 'diff' to 'hybrid'
+        help="Matching method: regex (fast), diff (balanced), hybrid (best, default), vector (semantic)"
     )
     matching_group.add_argument("--compare", action="store_true", 
                                help="Run all methods and compare results (single file only)")
