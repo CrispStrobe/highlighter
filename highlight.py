@@ -8,9 +8,9 @@ All features included:
 - Batch processing enabled by DEFAULT (process ALL books with 95%+ match confidence)
 - Library mode enabled by DEFAULT
 - Text formatting preservation (bold, italic, underline, links, footnotes)
+- Proper paragraph structure preservation
 - All 3 matching methods: regex, difflib, vector
 - Compare mode
-- Paragraph formatting preservation
 - HTML preservation for debugging (--preserve-html)
 - Enhanced verbose logging with -vv
 - Improved robustness and error handling
@@ -49,6 +49,7 @@ from pathlib import Path
 from difflib import SequenceMatcher
 from docx import Document
 from docx.enum.text import WD_COLOR_INDEX
+from docx.shared import Pt
 from bs4 import BeautifulSoup, NavigableString, Tag
 from thefuzz import process as fuzzy_process
 from thefuzz import fuzz
@@ -851,115 +852,89 @@ def find_book_highlights(ebook_title: str, all_clippings: List[Dict[str, str]]) 
     logger.debug(f"Returning {len(unique_highlights)} unique highlights")
     return unique_highlights
 
-# --- TEXT EXTRACTION WITH FORMATTING ---
+# --- TEXT EXTRACTION WITH PROPER PARAGRAPH STRUCTURE ---
 
-def extract_text_with_formatting(soup: BeautifulSoup) -> Tuple[str, List[int], List[Dict]]:
-    """
-    Extract text while preserving paragraph boundaries and inline formatting.
-    Returns: (full_text, paragraph_break_positions, formatting_spans)
-    formatting_spans = [{'start': int, 'end': int, 'type': str, 'data': any}, ...]
-    """
-    logger.debug("Extracting text with structure and formatting preservation...")
+class Paragraph:
+    """Represents a paragraph with text and formatting."""
+    def __init__(self):
+        self.text = ""
+        self.formatting = []  # List of (start, end, format_type, format_data)
     
-    text_parts = []
-    para_breaks = []
-    formatting_spans = []
+    def add_text(self, text: str, bold: bool = False, italic: bool = False, underline: bool = False, link: str = None):
+        """Add text with optional formatting."""
+        start = len(self.text)
+        self.text += text
+        end = len(self.text)
+        
+        if bold:
+            self.formatting.append((start, end, 'bold', None))
+        if italic:
+            self.formatting.append((start, end, 'italic', None))
+        if underline:
+            self.formatting.append((start, end, 'underline', None))
+        if link:
+            self.formatting.append((start, end, 'link', link))
+
+def extract_paragraphs_from_html(soup: BeautifulSoup) -> List[Paragraph]:
+    """Extract paragraphs with preserved formatting from HTML."""
+    logger.debug("Extracting paragraphs with formatting from HTML...")
     
-    # Find main content area
+    paragraphs = []
+    
+    # Find main content
     main_content = soup.find('body')
     if not main_content:
         main_content = soup
         logger.debug("No <body> tag found, using whole document")
     
-    # Track character position in the output text
-    char_pos = 0
+    # Find all block-level elements that should be paragraphs
+    block_elements = main_content.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'blockquote'])
     
-    # Process block-level elements
-    block_elements = main_content.find_all(['p', 'div', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'blockquote', 'pre'])
-    
-    if not block_elements:
-        logger.debug("No block elements found, using simple text extraction")
-        return soup.get_text(), [], []
-    
-    logger.debug(f"Processing {len(block_elements)} block elements")
+    logger.debug(f"Found {len(block_elements)} potential paragraph elements")
     
     processed_count = 0
     for block_elem in block_elements:
         processed_count += 1
         if processed_count % 100 == 0:
-            logger.debug(f"Processed {processed_count}/{len(block_elements)} block elements")
+            logger.debug(f"Processing paragraph {processed_count}/{len(block_elements)}")
         
-        # Extract text from this block with inline formatting
-        block_start_pos = char_pos
+        para = Paragraph()
         
-        for element in block_elem.descendants:
-            if isinstance(element, NavigableString):
-                text = str(element)
-                if text.strip():  # Only process non-empty text
-                    text_parts.append(text)
-                    text_start = char_pos
-                    char_pos += len(text)
-                    text_end = char_pos
-                    
-                    # Check parent for formatting
-                    parent = element.parent
-                    while parent and parent != block_elem:
-                        if parent.name in ['b', 'strong']:
-                            formatting_spans.append({
-                                'start': text_start,
-                                'end': text_end,
-                                'type': 'bold'
-                            })
-                            logger.debug(f"Bold: {text_start}-{text_end}")
-                        elif parent.name in ['i', 'em']:
-                            formatting_spans.append({
-                                'start': text_start,
-                                'end': text_end,
-                                'type': 'italic'
-                            })
-                            logger.debug(f"Italic: {text_start}-{text_end}")
-                        elif parent.name == 'u':
-                            formatting_spans.append({
-                                'start': text_start,
-                                'end': text_end,
-                                'type': 'underline'
-                            })
-                            logger.debug(f"Underline: {text_start}-{text_end}")
-                        elif parent.name == 'a' and parent.get('href'):
-                            formatting_spans.append({
-                                'start': text_start,
-                                'end': text_end,
-                                'type': 'link',
-                                'data': parent.get('href')
-                            })
-                            logger.debug(f"Link: {text_start}-{text_end} -> {parent.get('href')}")
-                        elif parent.name in ['sup', 'sub']:
-                            formatting_spans.append({
-                                'start': text_start,
-                                'end': text_end,
-                                'type': 'superscript' if parent.name == 'sup' else 'subscript'
-                            })
-                            logger.debug(f"{parent.name}: {text_start}-{text_end}")
-                        
-                        parent = parent.parent
+        # Process all children recursively
+        def process_element(elem, bold=False, italic=False, underline=False, link=None):
+            """Recursively process element and its children."""
+            if isinstance(elem, NavigableString):
+                text = str(elem)
+                if text.strip():  # Only add non-empty text
+                    para.add_text(text, bold=bold, italic=italic, underline=underline, link=link)
+            elif isinstance(elem, Tag):
+                # Check if this tag adds formatting
+                is_bold = bold or elem.name in ['b', 'strong']
+                is_italic = italic or elem.name in ['i', 'em']
+                is_underline = underline or elem.name == 'u'
+                current_link = link or (elem.get('href') if elem.name == 'a' else None)
+                
+                # Process children
+                for child in elem.children:
+                    process_element(child, is_bold, is_italic, is_underline, current_link)
         
-        # Add paragraph break after this block
-        if char_pos > block_start_pos:  # Only if we added text
-            text_parts.append('\n\n')
-            para_breaks.append(char_pos)
-            char_pos += 2
+        # Process the block element
+        for child in block_elem.children:
+            process_element(child)
+        
+        # Only add paragraph if it has text
+        if para.text.strip():
+            paragraphs.append(para)
+            if processed_count <= 5:
+                logger.debug(f"Paragraph {processed_count}: '{para.text[:80]}...' ({len(para.formatting)} formatting spans)")
     
-    full_text = ''.join(text_parts)
-    logger.debug(f"✓ Extracted {len(full_text)} characters with {len(para_breaks)} paragraph breaks and {len(formatting_spans)} formatting spans")
+    logger.debug(f"✓ Extracted {len(paragraphs)} paragraphs with formatting")
     
-    if logger.level <= logging.DEBUG and formatting_spans:
-        bold_count = sum(1 for f in formatting_spans if f['type'] == 'bold')
-        italic_count = sum(1 for f in formatting_spans if f['type'] == 'italic')
-        underline_count = sum(1 for f in formatting_spans if f['type'] == 'underline')
-        link_count = sum(1 for f in formatting_spans if f['type'] == 'link')
-        logger.debug(f"Formatting stats: {bold_count} bold, {italic_count} italic, {underline_count} underline, {link_count} links")
+    if logger.level <= logging.DEBUG and paragraphs:
+        total_formatting = sum(len(p.formatting) for p in paragraphs)
+        logger.debug(f"Total formatting spans across all paragraphs: {total_formatting}")
     
-    return full_text, para_breaks, formatting_spans
+    return paragraphs
 
 def create_highlighted_docx(
     html_path: str,
@@ -982,19 +957,28 @@ def create_highlighted_docx(
         logger.debug("Full traceback:", exc_info=True)
         handle_error(f"Could not read HTML file: {e}")
 
-    logger.debug("Extracting text with structure and formatting preservation...")
-    full_text_raw, para_breaks, formatting_spans = extract_text_with_formatting(soup)
+    logger.debug("Extracting paragraphs with formatting...")
+    paragraphs = extract_paragraphs_from_html(soup)
     
-    if not full_text_raw or len(full_text_raw) < 100:
-        handle_error("Extracted text from HTML is empty or too short. The book may be DRM-protected or corrupted.")
+    if not paragraphs:
+        handle_error("No paragraphs extracted from HTML. The book may be DRM-protected or corrupted.")
     
-    logger.debug(f"Book text length: {len(full_text_raw)} characters")
-    logger.debug(f"Paragraph breaks: {len(para_breaks)}")
-    logger.debug(f"Formatting spans: {len(formatting_spans)}")
-    logger.debug(f"First 200 chars: {full_text_raw[:200]}...")
+    # Build full text for matching
+    logger.debug("Building full text for highlight matching...")
+    full_text_parts = []
+    para_boundaries = [0]  # Start positions of each paragraph
+    
+    for para in paragraphs:
+        full_text_parts.append(para.text)
+        para_boundaries.append(len(''.join(full_text_parts)))
+    
+    full_text = ''.join(full_text_parts)
+    
+    logger.debug(f"Full text length: {len(full_text)} characters across {len(paragraphs)} paragraphs")
+    logger.debug(f"First 200 chars: {full_text[:200]}...")
     
     logger.debug("Starting highlight matching...")
-    found_spans, highlights_found = matcher_func(full_text_raw, highlights, threshold)
+    found_spans, highlights_found = matcher_func(full_text, highlights, threshold)
     
     percentage = (highlights_found/len(highlights)*100) if len(highlights) > 0 else 0
     logger.info(f"📊 Found {highlights_found} of {len(highlights)} highlights ({percentage:.1f}%)")
@@ -1009,110 +993,98 @@ def create_highlighted_docx(
     
     logger.debug(f"Sorting {len(found_spans)} found spans...")
     found_spans.sort()
-
-    logger.debug("Creating Word document with preserved structure and formatting...")
-    doc = Document()
-    doc.add_heading(doc_title, level=1)
     
-    # Create lookup sets for fast access
+    # Create set of highlighted character positions
     highlighted_chars = set()
     for start, end in found_spans:
         highlighted_chars.update(range(start, end))
     
-    para_break_set = set(para_breaks)
+    logger.debug("Creating Word document with proper paragraph structure...")
+    doc = Document()
+    doc.add_heading(doc_title, level=1)
     
-    # Build formatting map: char_pos -> [list of formatting dicts]
-    formatting_map = {}
-    for fmt in formatting_spans:
-        for pos in range(fmt['start'], fmt['end']):
-            if pos not in formatting_map:
-                formatting_map[pos] = []
-            formatting_map[pos].append(fmt)
+    # Map character positions to paragraph indices
+    def char_to_para(pos):
+        """Find which paragraph a character position belongs to."""
+        for i in range(len(para_boundaries) - 1):
+            if para_boundaries[i] <= pos < para_boundaries[i + 1]:
+                return i, pos - para_boundaries[i]  # para_index, pos_within_para
+        return len(paragraphs) - 1, pos - para_boundaries[-2]  # Last paragraph
     
-    logger.debug(f"Built formatting map for {len(formatting_map)} character positions")
+    logger.debug("Adding paragraphs to document with highlights and formatting...")
     
-    current_paragraph = doc.add_paragraph()
-    current_run_text = []
-    current_run_highlighted = False
-    current_run_formatting = set()  # Track active formatting for current run
-    
-    logger.debug("Adding text with highlights, paragraph breaks, and formatting...")
-    
-    chars_processed = 0
-    for i, char in enumerate(full_text_raw):
-        chars_processed += 1
-        if chars_processed % 10000 == 0:
-            logger.debug(f"Processed {chars_processed}/{len(full_text_raw)} characters")
+    for para_idx, para in enumerate(paragraphs):
+        if para_idx % 100 == 0 and para_idx > 0:
+            logger.debug(f"Processing paragraph {para_idx}/{len(paragraphs)}")
         
-        is_highlighted = i in highlighted_chars
-        char_formatting = set()
+        docx_para = doc.add_paragraph()
         
-        # Get formatting for this character
-        if i in formatting_map:
-            for fmt in formatting_map[i]:
-                char_formatting.add((fmt['type'], fmt.get('data')))
+        # Get global position of this paragraph
+        para_start_global = para_boundaries[para_idx]
         
-        # Check if we need to start a new paragraph
-        if i in para_break_set:
-            # Flush current run
-            if current_run_text:
+        # Build formatting map for this paragraph (local positions)
+        format_map = {}
+        for start, end, fmt_type, fmt_data in para.formatting:
+            for pos in range(start, end):
+                if pos not in format_map:
+                    format_map[pos] = []
+                format_map[pos].append((fmt_type, fmt_data))
+        
+        # Process character by character
+        current_run_text = []
+        current_run_highlighted = False
+        current_run_formats = set()
+        
+        for local_pos, char in enumerate(para.text):
+            global_pos = para_start_global + local_pos
+            is_highlighted = global_pos in highlighted_chars
+            
+            # Get formatting for this character
+            char_formats = set()
+            if local_pos in format_map:
+                for fmt_type, fmt_data in format_map[local_pos]:
+                    char_formats.add((fmt_type, fmt_data))
+            
+            # If formatting or highlight status changes, flush current run
+            if current_run_text and (is_highlighted != current_run_highlighted or char_formats != current_run_formats):
                 text = ''.join(current_run_text)
-                run = current_paragraph.add_run(text)
+                run = docx_para.add_run(text)
+                
+                # Apply highlight
                 if current_run_highlighted:
                     run.font.highlight_color = WD_COLOR_INDEX.YELLOW
+                
                 # Apply formatting
-                for fmt_type, fmt_data in current_run_formatting:
+                for fmt_type, fmt_data in current_run_formats:
                     if fmt_type == 'bold':
                         run.bold = True
                     elif fmt_type == 'italic':
                         run.italic = True
                     elif fmt_type == 'underline':
                         run.underline = True
+                    # Note: python-docx doesn't easily support hyperlinks in highlighted text
+                
                 current_run_text = []
             
-            # Start new paragraph
-            current_paragraph = doc.add_paragraph()
-            if char == '\n' and i + 1 < len(full_text_raw) and full_text_raw[i + 1] == '\n':
-                continue  # Skip the paragraph break markers
-            continue
+            current_run_text.append(char)
+            current_run_highlighted = is_highlighted
+            current_run_formats = char_formats
         
-        # If highlight status or formatting changes, flush current run and start new one
-        if current_run_text and (is_highlighted != current_run_highlighted or char_formatting != current_run_formatting):
+        # Flush final run
+        if current_run_text:
             text = ''.join(current_run_text)
-            run = current_paragraph.add_run(text)
+            run = docx_para.add_run(text)
+            
             if current_run_highlighted:
                 run.font.highlight_color = WD_COLOR_INDEX.YELLOW
-            # Apply formatting
-            for fmt_type, fmt_data in current_run_formatting:
+            
+            for fmt_type, fmt_data in current_run_formats:
                 if fmt_type == 'bold':
                     run.bold = True
                 elif fmt_type == 'italic':
                     run.italic = True
                 elif fmt_type == 'underline':
                     run.underline = True
-            
-            current_run_text = []
-            current_run_highlighted = is_highlighted
-            current_run_formatting = char_formatting
-        
-        current_run_text.append(char)
-        if not current_run_text or len(current_run_text) == 1:
-            current_run_highlighted = is_highlighted
-            current_run_formatting = char_formatting
-    
-    # Flush final run
-    if current_run_text:
-        text = ''.join(current_run_text)
-        run = current_paragraph.add_run(text)
-        if current_run_highlighted:
-            run.font.highlight_color = WD_COLOR_INDEX.YELLOW
-        for fmt_type, fmt_data in current_run_formatting:
-            if fmt_type == 'bold':
-                run.bold = True
-            elif fmt_type == 'italic':
-                run.italic = True
-            elif fmt_type == 'underline':
-                run.underline = True
     
     logger.debug("✓ Document creation complete")
     return doc, highlights_found
