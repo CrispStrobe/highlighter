@@ -219,3 +219,7 @@ Uses these excellent libraries:
 - thefuzz - Fuzzy string matching
 - Calibre - Ebook conversion
 - sentence-transformers - AI semantic matching (optional)
+
+## Trademarks and affiliation
+
+This project is independent and is not affiliated with, endorsed by or sponsored by Amazon.com, Inc. or its affiliates. Kindle, Amazon and Calibre are trademarks of their respective owners. All names are used only to identify compatible devices, software and file formats.
